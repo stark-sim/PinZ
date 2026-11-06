@@ -1,357 +1,139 @@
-# EShot
+# PinZ
 
-Native screenshot, annotation, OCR, visual-search, upload, GIF, and video capture for Windows and Linux.
+<img src="docs/images/pinZ-icon.svg" alt="PinZ icon" width="128">
 
-[![Latest release](https://img.shields.io/github/v/tag/Benoks/EShot?label=release&sort=semver)](https://github.com/Benoks/EShot/releases/latest)
-[![Build](https://github.com/Benoks/EShot/actions/workflows/build.yml/badge.svg)](https://github.com/Benoks/EShot/actions/workflows/build.yml)
-[![Platforms](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-4b8bbe)](#platform-support)
+Fast screenshot and pinning tool for GNOME on Linux, designed for low-latency capture and always-on-top references.
+
+[![Platform](https://img.shields.io/badge/platform-GNOME%20Wayland%20%7C%20Linux-4b8bbe)](#platform-status)
 [![Qt](https://img.shields.io/badge/Qt-6.x-41cd52)](https://www.qt.io/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> [!IMPORTANT]
-> EShot supports KDE Plasma 6 Wayland and GNOME Wayland. KDE Plasma is the primary tested Linux target, while GNOME support is stable for normal use but has received less broad real-world testing. Other desktop environments and compositors remain unsupported and are unlikely to work correctly.
+> [!NOTE]
+> PinZ is a GNOME-focused product built from the MIT-licensed EShot codebase. The visible product direction and documentation use PinZ, while some binary names, settings paths, desktop IDs, and packaging files still use the legacy `EShot` name until the technical rename is completed.
 
-> [!WARNING]
-> **Linux AppImage: the AppImage is the installer. Just make it executable and run it.**
-> Do **not** add it to Gear Lever, AppImageLauncher, AppImageUpdate or any other AppImage manager or updater. On first launch EShot's own setup installs the optional system packages, adds EShot to the application menu (`~/.local/opt/EShot`) and keeps that copy updated. A manager makes a second copy that does not get EShot's updates and can end up with duplicate menu entries, shortcuts and autostart. If a manager already took it, remove EShot from the manager and run the downloaded AppImage again. On Arch/CachyOS, prefer the [AUR package](#arch-linux-and-cachyos).
+## What PinZ does
 
-EShot keeps the complete screenshot workflow in one compact tray application: select a region, annotate it, copy or save it, extract text, search the image, upload it, pin it above other windows, or record it as GIF/MP4.
+- Capture a screen region with a low-latency selection overlay
+- Annotate with pen, arrow, line, rectangle, ellipse, text, highlighter, blur, pixelate, counter, eraser, and eyedropper tools
+- Pin captures above other windows for reference while you work
+- Run local OCR from the capture overlay or directly from a pinned image
+- Copy, save, upload, or visually search the selected region
+- Record the selected region as GIF or MP4
+- Use global hotkeys, direct actions, command-line triggers, and a compact control window
 
-This GNOME-focused hard fork adds an opt-in persistent ScreenCast capture path for PixPin-like low-latency capture and pinned-image OCR. On GNOME XWayland the capture overlay grabs keyboard focus directly instead of mapping its tiny text-focus proxy on every capture; the proxy is reserved for actual text editing. For input/screen diagnostics, setting `ESHOT_SCREEN_VERIFY_PATH=/path/to/frame.png` saves the latest compositor frame after a selection completes. The upstream MIT license is retained in `LICENSE`. The GNOME product direction, measured performance, limitations, and proposed PinZ naming are recorded in [docs/gnome-product-record.zh-CN.md](docs/gnome-product-record.zh-CN.md).
+## Why it is fast
 
-## Screenshots
+The normal GNOME screenshot path waits until the hotkey is pressed, then asks the portal for a new screenshot. PinZ optionally moves that work out of the user-waiting path:
 
-| Windows | Linux (CachyOS / KDE Plasma 6) |
-| --- | --- |
-| <img src="docs/images/eshot-windows.png" alt="EShot on Windows" width="760"> | <img src="docs/images/eshot-linux.png" alt="EShot on CachyOS with KDE Plasma 6" width="760"> |
+```text
+screen changes
+→ persistent, user-approved ScreenCast stream
+→ PipeWire/GStreamer receives frames in the background
+→ only the newest frame is retained
 
-## Platform support
-
-| Platform | Status | Distribution |
-| --- | --- | --- |
-| Windows 10/11 x64 | Stable | Installer and portable ZIP |
-| Windows 11 ARM64 | Stable | Native ARM64 installer and portable ZIP |
-| Linux x86_64 (KDE Plasma 6 Wayland) | Stable | AppImage, AUR, and portable archive |
-| Linux x86_64 (GNOME Wayland) | Stable, less broadly tested | AppImage, AUR, and portable archive |
-| Other Linux desktops | Unsupported | Unlikely to work correctly |
-
-## Features
-
-- Region and monitor capture with multi-monitor and high-DPI handling, plus window selection capture on Windows and KDE Plasma
-- Compact selection overlay with configurable actions and shortcuts
-- Pen, arrow, line, rectangle, ellipse, text, highlighter, smooth blur, pixelate, counter, eraser, and eyedropper tools
-- Resize and rotate selected text and shapes directly on the canvas
-- Hold `Shift` while drawing with the highlighter to lock it to the nearest axis
-- Undo/redo, selection locking, color controls, and configurable toolbar visibility
-- Tesseract OCR with selectable language packs, copy, retry, and one-click Google Translate handoff
-- Google Lens or Yandex Images visual search for the selected region
-- Screenshot uploads to Catbox, Uguu, TmpFiles.org, temp.sh, Allwebs, Radikal Cloud, Google Drive, and Yandex Disk
-- Always-on-top pinned captures, with local OCR available from the pin's context menu
-- Selected-region GIF recording
-- MP4 recording with configurable FPS, quality, duration, desktop audio, and microphone audio
-- Real microphone-device selection on Linux and Windows
-- Global capture and direct screenshot/GIF/video hotkeys
-- Configurable pause, stop, and cancel recording shortcuts
-- Settings import/export and automatic release checks
-- Self-update support for installed AppImages
-
-## Capture workflow
-
-Start a capture from the tray icon, `Print Screen`, a custom global shortcut, a direct-action shortcut, or the command line. Select a region and use the overlay toolbar to annotate, OCR, search, upload, pin, copy, save, or begin recording.
-
-Double-clicking a screen during selection captures that complete monitor. The overlay adapts to tight spaces and scaled multi-monitor layouts.
-
-**Capture Window** (tray menu or its own hotkey) highlights the window under the mouse; click to select it, then annotate and save as usual. It is available on Windows and on KDE Plasma (Wayland and X11). On KDE, EShot asks KWin for the window list with a short KWin script while the screenshot is taken; dragging still selects a free region, and if KWin does not answer within a second the capture continues with free selection only. Other Linux desktops do not offer window capture.
-
-## Install
-
-Download the latest build from [GitHub Releases](https://github.com/Benoks/EShot/releases/latest).
-
-### Windows
-
-1. Download `EShot_Setup_v<version>_x64.exe` or the ARM64 installer.
-2. Run the installer and choose the optional FFmpeg/OCR components you need.
-3. Launch EShot from the Start menu or system tray.
-
-The installer defaults to the current user and does not require administrator permission. An all-users install is optional and may require an administrator account; each account can enable auto-start from EShot Settings. Existing all-users installations stay in that mode when updated; uninstall the old installation first if you want to switch to a per-user install. For all-users installs, uninstall can remove per-user auto-start entries only from profiles loaded at that time. Windows may restrict capture or keyboard focus over applications running as administrator and the UAC secure desktop. To capture them, turn on **Start as administrator** in Settings: after one administrator prompt, EShot starts elevated without further prompts.
-
-Portable x64 and ARM64 ZIP archives are also attached to each release.
-
-### Linux: KDE Plasma 6 and GNOME Wayland
-
-KDE Plasma 6 Wayland and GNOME Wayland are supported Linux targets. KDE Plasma is the primary tested environment. GNOME is stable for normal use, although its wider real-world testing coverage is still smaller. As with any Wayland desktop, portal versions can affect capture, shortcuts, tray integration, and recording behavior.
-
-Do not open the AppImage with Gear Lever, AppImageLauncher or another AppImage manager; EShot integrates and updates itself (see the warning at the top).
-
-1. Download `EShot-v<version>-x86_64.AppImage`.
-2. Mark it executable:
-
-   ```bash
-   chmod +x EShot-v*-x86_64.AppImage
-   ```
-
-3. Start it from a terminal:
-
-   ```bash
-   ./EShot-v*-x86_64.AppImage
-   ```
-
-   KDE Plasma commonly offers a graphical launch flow after the file is executable. Stock GNOME Files does not register AppImages as applications, so double-clicking can show an "open with" prompt instead of starting EShot. Running the two commands above is the reliable first-launch method on GNOME. Avoid AppImage managers such as AppImageLauncher or Gear Lever for EShot; they move the file and skip EShot's own setup and updates.
-
-4. Complete the graphical first-run wizard. It can install FFmpeg/GStreamer, PipeWire portal components, Tesseract, selected OCR languages, and optional application-menu integration through the system package manager.
-5. Use **Use Print Screen for EShot** to assign `Print Screen`. KDE keeps Spectacle's other shortcuts. GNOME uses the Global Shortcuts portal when available and an EShot-only custom shortcut on older GNOME releases.
-
-#### AppImage first launch and integration
-
-The AppImage is portable. Opening it does not install EShot system-wide. The Welcome screen appears only on the first launch; completing or skipping the optional setup marks it complete, so it does not return on later launches.
-
-When **Add EShot to the application menu and install shortcuts** is selected, the setup copies the AppImage to `~/.local/opt/EShot/EShot.AppImage`, creates an application-menu entry, and restarts from that managed copy after successful setup. Launch EShot from the application menu after that point. The original file in Downloads remains a separate portable copy and can be removed once the menu entry works. If the option is not selected, nothing is copied and you continue launching the same AppImage manually.
-
-The AppImage bundles EShot and Qt. Optional media, OCR, and desktop-integration packages remain system packages. Skipped dependencies can be installed later from **Settings → Open Linux dependency setup**. A native package such as the AUR package is the smoother option for users who want an ordinary application-menu entry and package-manager updates.
-
-Each release also includes `EShot-v<version>-linux-x64.tar.gz` for users who prefer an unpacked build. Unlike the AppImage, this archive relies on compatible Qt and runtime libraries installed by the Linux distribution.
-
-Integrated AppImages are stored for the current user under `~/.local/opt/EShot`. EShot checks for updates and always keeps manual updating available. If a per-user Windows installation or integrated AppImage is at least two stable releases behind, EShot downloads the matching release asset, verifies its GitHub SHA-256 digest, updates silently, and restarts. All-users Windows installations require an administrator for updates. The AUR package (`eshot-bin`) and the `.tar.gz` archive are updated through the package manager or a new download; EShot only reports new releases there and does not replace them itself.
-
-### Disable automatic update checks for managed portable installs
-
-Starting with 4.7.0, place an empty file named `.portable` beside the EShot
-executable to disable automatic update checks and silent updates. For an
-AppImage, place the file beside the original `.AppImage` file. This lets a
-package manager handle updates without EShot checking in the background.
-Manual update checks remain available. Removing the marker restores the normal
-update behavior. The marker does not change where EShot stores settings.
-
-### Arch Linux and CachyOS
-
-Install the EShot-maintained AUR binary package with an AUR helper:
-
-```bash
-yay -S eshot-bin
+hotkey
+→ consume the latest frame
+→ show the selection overlay immediately
 ```
 
-The package installs the release AppImage and its desktop entry through pacman. Update it with your normal AUR helper rather than EShot's AppImage updater.
+Fast Capture currently:
 
-### Uninstall on Linux
+- Uses GNOME's XDG Desktop Portal; it does not bypass screen permission
+- Keeps GNOME's screen-sharing indicator visible
+- Restores the authorized stream with the portal restore token
+- Limits the stream to 10 FPS and keeps only the newest frame
+- Shares the mapped PipeWire buffer with `QImage` instead of copying every 4K frame
+- Falls back to the normal one-shot Screenshot portal when the stream is unavailable, stale, unsupported, or revoked
 
-Use **Settings → General → Remove EShot from this system**, or run `--uninstall` from a terminal in your desktop session. Either way EShot asks a running instance to quit, then:
+## Verified GNOME performance
 
-- gives Print Screen back to the desktop: GNOME gets its screenshot UI shortcut back and EShot's custom keybinding is removed; on KDE, EShot's global shortcuts are removed and Spectacle gets plain Print back if EShot had taken it;
-- removes the autostart entry and the KWin screenshot permission entry;
-- for AppImage installs, also removes the integrated copy (`~/.local/opt/EShot`), the application menu entry and EShot's icons.
+Measured on GNOME Wayland with the Qt overlay running through XWayland and a 3840×2160 PipeWire frame:
 
-```bash
-# AppImage
-~/.local/opt/EShot/EShot.AppImage --uninstall
+| Stage | Measured |
+| --- | ---: |
+| Overlay window presentation returned | 10 ms |
+| First frame painted | 17 ms |
+| Pointer movement accepted | 34 ms |
+| Pointer press accepted | 150 ms |
+| Selection completed | 250 ms |
+| Persistent stream CPU usage | 0.2% over 5 seconds |
 
-# AUR: clean up first, then remove the package
-eshot --uninstall
-sudo pacman -R eshot-bin
-```
+Pointer timings include deliberate waits in the kernel-input test harness. The overlay's own first-frame path is already near one display frame.
 
-For the AUR package and the `.tar.gz` archive, files owned by the package manager or the extracted folder are left alone. Settings in `~/.config/EShot` and your saved screenshots and recordings are kept; delete them yourself if you no longer need them.
+## Platform status
 
-### Linux runtime notes
-
-- Wayland screenshots and recordings use XDG Desktop Portal and PipeWire.
-- KDE global shortcuts use KGlobalAccel. The window-capture shortcut has no default key on KDE because Spectacle already uses `Shift+Print` and `Meta+Print`; set one in **Settings → Hotkey**. GNOME uses the Global Shortcuts portal where available and can install an EShot-only GNOME custom shortcut as a compatibility fallback. Host app-id registration happens before `QApplication` so QPA cannot issue an earlier portal request (required by xdg-desktop-portal 1.21+/GNOME 50).
-- Stock GNOME does not expose legacy tray icons. When no tray integration is available, launching EShot from the application list opens a compact control window with Capture, Record GIF, Record Video, Open Screenshots Folder, Settings, About, and Quit. Autostart remains silent. `Print Screen` and custom shortcuts continue to work independently of the tray.
-- GNOME screenshots normally use the secure one-shot Screenshot portal. **Settings → Capture → Fast capture** instead keeps one user-approved persistent ScreenCast session, restores it with the portal's restore token, and retains only the newest PipeWire frame as a zero-copy BGRA view until capture. GNOME's sharing indicator remains visible while this opt-in mode is active. It currently supports one monitor; multi-monitor, stale-frame, unavailable-session, and non-GNOME captures automatically use the normal Screenshot portal.
-- GNOME and KDE Wayland use an XWayland selection overlay so text entry, focus, one-canvas multi-monitor selection and the placement of pinned images and recording controls behave consistently. On KDE, `ESHOT_CAPTURE_BACKEND=wayland` opts into experimental per-output native surfaces, which give sharper previews on mixed-DPI setups but cannot place pinned images or the recording frame.
-- GIF recording uses GStreamer for portal capture and FFmpeg for final GIF encoding.
-- MP4 recording requires a GStreamer AAC encoder when audio is enabled.
-- Screen recording permission is handled by the desktop portal. EShot stores a separate restore token per monitor when the portal supports persistent sessions.
-- A recorded region must fit inside one monitor. If the portal opens a monitor chooser, select the monitor containing the region.
-- The optional dependency setup uses the PackageKit session installer when the desktop provides it, then falls back to the native pacman, apt or dnf workflow. On Fedora, packages the enabled repositories do not provide (such as RPM Fusion packages) are skipped instead of failing the whole install.
-- Fedora: the setup installs `ffmpeg-free` and the GStreamer plugins from Fedora's own repositories. MP4 recording needs `x264enc` from RPM Fusion's `gstreamer1-plugins-ugly`; enable [RPM Fusion](https://rpmfusion.org/Configuration) (free and nonfree) before running the setup, or install that package afterwards.
-
-## Visual search
-
-Choose **Google Lens** or **Yandex Images** in Settings. EShot uploads only the selected region to a temporary public image host and opens the chosen visual-search provider with that temporary URL.
-
-Do not use visual search for private or sensitive screenshots.
-
-## OCR
-
-OCR is powered by Tesseract. The first-run wizard can install English, the system language, and additional language data. Missing languages remain visible but disabled so the missing dependency is clear. The OCR result dialog can copy recognized text or open it in Google Translate. Translation opens the browser and does not send OCR text through an EShot translation service.
-
-## Upload services
-
-Anonymous providers work without credentials. Google Drive and Yandex Disk require OAuth access tokens; Allwebs and Radikal Cloud require service API keys. OAuth tokens are stored in the operating system credential store, never in EShot's plain-text settings file.
-
-### Google Drive token setup
-
-1. Open [Google OAuth 2.0 Playground](https://developers.google.com/oauthplayground).
-2. Select the Drive API v3 scope:
-
-   ```text
-   https://www.googleapis.com/auth/drive.file
-   ```
-
-3. Authorize the scope and exchange the authorization code for tokens.
-4. Copy the `access_token`, or copy the complete JSON response.
-5. Paste it into EShot's Google Drive token field.
-
-OAuth Playground access tokens expire. Generate a new token if an upload later returns HTTP 401.
-
-## Default shortcuts
-
-Most shortcuts can be changed in Settings. Press `?` (or `F1`) during a capture to see the keys that are currently configured.
-
-### Global
-
-| Shortcut | Action |
+| Platform | Status |
 | --- | --- |
-| `Print Screen` | Start region capture |
-| `Shift+Print Screen` | Capture a window (Windows; on KDE Plasma, set a key in Settings) |
+| GNOME Wayland, single monitor | Primary target; Fast Capture available |
+| GNOME Wayland, multiple monitors | Works through the normal portal fallback |
+| KDE Plasma Wayland | Inherited EShot support; not the current PinZ focus |
+| Windows / macOS | Inherited code remains, but PinZ product testing currently targets GNOME |
 
-Instant capture, GIF and video recording, and the recording controls (pause, stop, cancel) have their own global shortcuts in **Settings → Hotkey**.
+## Quick start
 
-### Selection
-
-| Shortcut | Action |
-| --- | --- |
-| Drag | Select an area |
-| Click a window | Select that window (window capture) |
-| Double-click a screen | Capture the complete monitor |
-| `Enter` / `Ctrl+C` | Copy selection |
-| `Ctrl+S` | Save selection |
-| `Ctrl+P` | Pin selection to the screen |
-| `K` | Lock or unlock the selection |
-| Arrow keys | Move the selection (`Shift`: 10 px) |
-| `Ctrl` + arrow keys | Resize the selection (`Shift`: 10 px) |
-| `Esc` | Cancel or close |
-| `?` / `F1` | Show or hide the shortcut sheet |
-
-### Actions
-
-| Shortcut | Action |
-| --- | --- |
-| `Ctrl+O` | Recognize text (OCR) |
-| `Ctrl+U` | Upload |
-| `Ctrl+L` | Visual search (Google Lens or Yandex Images) |
-| `Ctrl+G` | Record the selection as a GIF |
-| `Ctrl+Shift+V` | Record the selection as a video |
-
-### Tools
-
-| Shortcut | Action |
-| --- | --- |
-| `P` | Pen |
-| `A` | Arrow |
-| `L` | Line |
-| `R` | Rectangle |
-| `C` | Circle |
-| `D` | Semi-transparent rectangle |
-| `H` | Highlighter |
-| `T` | Text |
-| `B` | Blur |
-| `M` | Pixelate |
-| `N` | Counter |
-| `X` | Eraser |
-| `I` | Eyedropper |
-
-### Editing
-
-| Shortcut | Action |
-| --- | --- |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
-| `Del` | Delete the selected object |
-| `Ctrl` + click | Move an object |
-| Arrow keys | Nudge the selected object |
-| `Shift` + drag | Straight line, square or circle |
-| Double-click / `F2` | Edit a text object |
-| `Enter` / `Shift+Enter` | Finish text / new line |
-| `Ctrl+B` | Bold text |
-| `Ctrl` `+` / `Ctrl` `-` | Larger / smaller text |
-
-## Command line
-
-| Option | Effect |
-| --- | --- |
-| `--capture` | Start a region capture (in the running instance if there is one) |
-| `--save <path>` | Capture and save the selection to `<path>` |
-| `--settings` | Open Settings |
-| `--control` | Open the compact control window (used by the application-menu entry on desktops without a tray) |
-| `--silent` | Start in the background without the first-run wizard (used by autostart) |
-| `--quit` | Quit the running instance |
-| `--uninstall` | Linux: restore Print Screen and remove EShot's desktop integration for this user |
-
-```powershell
-# Windows
-EShot.exe --capture
-EShot.exe --save "C:\path\to\capture.png"
-EShot.exe --settings
-EShot.exe --silent
-EShot.exe --quit
-```
-
-```bash
-# Linux
-EShot --capture
-EShot --save "$HOME/Pictures/capture.png"
-EShot --settings
-EShot --control
-EShot --silent
-EShot --quit
-EShot --uninstall  # restore Print Screen and remove desktop integration
-
-# Native packages also install the lowercase launcher:
-eshot --capture
-```
-
-## Questions, ideas and bug reports
-
-- **Questions and help:** ask in [Discussions → Q&A](https://github.com/Benoks/EShot/discussions/categories/q-a).
-- **Ideas and feature requests:** post them in [Discussions → Ideas](https://github.com/Benoks/EShot/discussions/categories/ideas), where others can vote on them.
-- **Bugs:** open an [issue](https://github.com/Benoks/EShot/issues/new). Include your EShot version, OS and, on Linux, your desktop (KDE/GNOME) and session (Wayland/X11).
-
-
-## Build from source
-
-Core requirements:
-
-- CMake 3.16+
-- C++17 compiler
-- Qt 6 Core, GUI, Widgets, Network, and DBus on Linux
-
-### Linux
-
-Ubuntu/Debian and CachyOS/Arch dependency helpers are included:
+PinZ has not published renamed release packages yet. Build from source:
 
 ```bash
 ./scripts/linux/install-ubuntu-deps.sh
-# or
-./scripts/linux/install-cachyos-deps.sh
-
 ./scripts/linux/check-linux-runtime.sh
 ./scripts/linux/build-linux.sh
 ./dist-linux/bin/EShot
 ```
 
-Build the AppImage:
+For the current development build:
 
 ```bash
-./scripts/linux/build-appimage.sh
+cmake --build build -j8
+./build/bin/EShot --control
 ```
 
-### Windows
+The executable and desktop integration still use the legacy `EShot` names. That is expected until the technical rename lands.
 
-```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release --parallel
-```
+## Enable GNOME Fast Capture
 
-Build the installer with Inno Setup 6:
+1. Start the app.
+2. Open **Settings → Capture**.
+3. Enable **Fast capture**.
+4. Approve GNOME's ScreenCast picker once.
 
-```powershell
-iscc packaging/windows/EShot_Setup.iss
-```
+After approval, PinZ reuses the persistent stream. To revoke it, disable Fast Capture or stop screen sharing from GNOME's sharing indicator.
 
-## Third-party components
+## Core shortcuts
 
-EShot uses Qt, Tesseract OCR, FFmpeg, GStreamer, PipeWire, XDG Desktop Portal, and Inno Setup. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for licensing details.
+| Shortcut | Action |
+| --- | --- |
+| `Print Screen` | Start region capture |
+| Drag | Select a region |
+| `Ctrl+C` / `Enter` | Copy selection |
+| `Ctrl+S` | Save selection |
+| `Ctrl+P` | Pin selection to the screen |
+| `Ctrl+O` | OCR selection |
+| `Ctrl+G` | Record selection as GIF |
+| `Ctrl+Shift+V` | Record selection as video |
+| `Esc` | Cancel or close |
+| `?` / `F1` | Show the shortcut sheet |
 
-## License
+## Product and engineering records
 
-EShot is released under the [MIT License](LICENSE).
+- [GNOME product record](docs/gnome-product-record.zh-CN.md): product direction, naming, architecture, measured performance, limitations, and roadmap
+- [Linux dependency setup](docs/linux-dependency-setup.md)
+- [Linux port test notes](docs/linux-port-test.md)
+
+## Current limitations
+
+- Fast Capture supports one GNOME Wayland monitor; multi-monitor capture uses the portal fallback
+- The overlay still converts the latest `QImage` to `QPixmap` when capture starts
+- The overlay currently runs through XWayland for consistent input and pinned-window behavior
+- Scrolling/long screenshot is not implemented yet
+- Binary names, App IDs, desktop files, settings paths, and release packaging still use EShot names
+- DMA-BUF/GPU-texture capture is a later QRhi/OpenGL/Vulkan-level optimization, not part of the current Qt Widgets overlay
+
+## Issues and feedback
+
+Open an issue in [stark-sim/PinZ](https://github.com/stark-sim/PinZ/issues). Include your GNOME version, Wayland session, monitor layout, and whether **Fast capture** was enabled.
+
+## Attribution and license
+
+PinZ is built from [EShot](https://github.com/Benoks/EShot), which is MIT licensed. The upstream license is retained in [LICENSE](LICENSE), and third-party licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+PinZ itself is released under the [MIT License](LICENSE).
