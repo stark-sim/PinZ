@@ -1,0 +1,69 @@
+/* EShot Global Styles */
+
+/* Main application styling */
+QWidget {
+    font-family: "Segoe UI", sans-serif;
+}
+
+/* Toolbar styling */
+AnnotationToolbar {
+    background: rgba(40, 40, 40, 0.95);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+QPushButton {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 14px;
+    color: white;
+    min-width: 32px;
+    min-height: 32px;
+}
+
+QPushButton:hover {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+QPushButton:pressed {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+QPushButton[selected="true"] {
+    background: rgba(0, 120, 215, 0.8);
+}
+
+/* Dimension label */
+QLabel#dimensionLabel {
+    background: rgba(0, 120, 215, 1);
+    color: white;
+    padding: 4px 8px;
+    border-radius: 3px;
+    font-weight: bold;
+}
+
+/* Context menu styling */
+QMenu {
+    background: rgba(45, 45, 45, 0.98);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    padding: 4px;
+}
+
+QMenu::item {
+    padding: 8px 24px;
+    border-radius: 4px;
+    color: white;
+}
+
+QMenu::item:selected {
+    background: rgba(0, 120, 215, 0.8);
+}
+
+QMenu::separator {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.1);
+    margin: 4px 8px;
+}

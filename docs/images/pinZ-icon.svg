@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">PinZ icon</title>
+  <desc id="desc">A Z-shaped lightning bolt inside a map-pin outline on a dark rounded-square screen tile.</desc>
+  <defs>
+    <linearGradient id="tile" x1="72" y1="48" x2="440" y2="464" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#17233f"/>
+      <stop offset="0.52" stop-color="#111827"/>
+      <stop offset="1" stop-color="#0b1020"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="157" y1="116" x2="354" y2="398" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fef08a"/>
+      <stop offset="0.48" stop-color="#facc15"/>
+      <stop offset="1" stop-color="#fb923c"/>
+    </linearGradient>
+    <linearGradient id="pin" x1="112" y1="72" x2="400" y2="456" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0.98  0 1 0 0 0.72  0 0 1 0 0.08  0 0 0 0.5 0" result="glow"/>
+      <feMerge>
+        <feMergeNode in="glow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect x="32" y="32" width="448" height="448" rx="108" fill="url(#tile)"/>
+  <rect x="48" y="48" width="416" height="416" rx="94" fill="none" stroke="#60a5fa" stroke-opacity="0.16" stroke-width="3"/>
+
+  <path d="M256 75C168.9 75 98 145.9 98 233c0 111.8 130.4 213.1 158 232 27.6-19 158-120.2 158-232 0-87.1-70.9-158-158-158Z"
+        fill="none" stroke="url(#pin)" stroke-width="24" stroke-linejoin="round" opacity="0.78"/>
+  <circle cx="256" cy="233" r="101" fill="#0f172a" fill-opacity="0.58" stroke="#bae6fd" stroke-opacity="0.16" stroke-width="3"/>
+
+  <path d="M151 124H356L240 242H353L172 396L220 282H145L263 190H151Z"
+        fill="url(#bolt)" filter="url(#glow)" stroke="#713f12" stroke-opacity="0.22" stroke-width="4" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,102 @@
+#pragma once
+
+#include <QList>
+#include <QString>
+
+class QSettings;
+
+enum class RecordingAudioSource
+{
+    Desktop,
+    Microphone
+};
+
+int gifRecordingFpsLimit();
+int videoRecordingFpsLimit();
+
+bool initialAudioEnabled(bool hasExplicitSetting,
+                         bool explicitEnabled,
+                         bool hasLegacyMode,
+                         const QString &legacyMode,
+                         RecordingAudioSource source);
+
+bool loadRecordingAudioEnabled(QSettings &settings, RecordingAudioSource source);
+bool shouldDiscoverAudioDevices(bool microphoneEnabled,
+                                const QString &microphoneDevice);
+
+// Audio sources a running recording really records (shown by the recording
+// indicator): a source is in only when it is enabled, audible, its input
+// was resolved (device present, dshow input opened...) and there is an
+// audio encoder for it.
+struct EffectiveRecordingAudio {
+    bool desktop = false;
+    bool microphone = false;
+};
+EffectiveRecordingAudio effectiveRecordingAudio(bool desktopEnabled, int desktopVolume,
+                                                bool desktopInputResolved,
+                                                bool microphoneEnabled, int microphoneVolume,
+                                                bool microphoneInputResolved,
+                                                bool audioEncoderAvailable);
+
+// Defaults of the raw recording keys the recorders read.
+constexpr int DefaultGifFps = 12;            // "recordingFps"
+constexpr int LegacyDefaultGifFps = 10;      // default before quality presets
+constexpr int DefaultGifMaxSide = 1280;      // "recordingMaxSide"
+constexpr int DefaultGifMaxSeconds = 30;     // "recordingMaxSeconds"
+constexpr int DefaultVideoFps = 30;          // "videoRecordingFps"
+constexpr int DefaultVideoCrf = 24;          // "videoRecordingCrf"
+constexpr int DefaultVideoMaxSeconds = 0;    // "videoRecordingMaxSeconds"
+constexpr int MinVideoCrf = 18;
+constexpr int MaxVideoCrf = 32;
+
+// Quality presets offered in the recording drawer and in Settings. Choosing
+// one writes the raw keys above; Custom means the raw values match no preset.
+enum class RecordingQualityPreset
+{
+    Small,
+    Balanced,
+    High,
+    Custom
+};
+
+struct GifQualityValues
+{
+    int maxSide = DefaultGifMaxSide;
+    int fps = DefaultGifFps;
+};
+
+struct VideoQualityValues
+{
+    int crf = DefaultVideoCrf;
+    int fps = DefaultVideoFps;
+};
+
+// Selectable presets in display order (Custom is never offered for picking).
+QList<RecordingQualityPreset> selectableRecordingQualityPresets();
+// Raw values of a preset; Custom yields the Balanced values.
+GifQualityValues gifQualityValues(RecordingQualityPreset preset);
+VideoQualityValues videoQualityValues(RecordingQualityPreset preset);
+// Preset whose values are exactly these, otherwise Custom.
+RecordingQualityPreset gifQualityPresetFor(int maxSide, int fps);
+RecordingQualityPreset videoQualityPresetFor(int crf, int fps);
+// Stable setting values ("small", "balanced", "high", "custom").
+QString recordingQualityPresetKey(RecordingQualityPreset preset);
+RecordingQualityPreset recordingQualityPresetFromKey(const QString &key);
+
+// Current presets derived from the raw keys (which stay authoritative). A
+// stored "custom" key keeps Custom even when the raw values happen to match
+// a preset: the user chose to edit the values. Untouched pre-preset defaults
+// move to Balanced once, so existing installs do not start out as "Custom":
+// GIF 1280 px at 10 fps, and video CRF 24 (the only default CRF there ever
+// was) at up to 30 fps. A video frame rate above 30 fps is kept as Custom.
+RecordingQualityPreset loadGifQualityPreset(QSettings &settings);
+RecordingQualityPreset loadVideoQualityPreset(QSettings &settings);
+// Longest-side choices for a custom GIF, in pixels.
+QList<int> gifMaxSideChoices();
+// Video quality as a "higher is better" slider position and back; the
+// encoder's CRF runs the other way (lower CRF = higher quality).
+int videoQualitySliderValue(int crf);
+int videoCrfFromQualitySlider(int sliderValue);
+// Write a preset's raw values plus the preset key; Custom only stores the key.
+void applyGifQualityPreset(QSettings &settings, RecordingQualityPreset preset);
+void applyVideoQualityPreset(QSettings &settings, RecordingQualityPreset preset);

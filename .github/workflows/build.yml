@@ -1,0 +1,587 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  APP_VERSION: '4.8.0'
+  QT_VERSION: '6.8.2'
+  TESSERACT_RUNTIME_RELEASE: 'v4.1.2'
+
+jobs:
+  linux-build:
+    name: Build Linux x64
+    runs-on: ubuntu-22.04
+    env:
+      BUILD_DIR: ${{ github.workspace }}/build-linux
+      DIST_DIR: ${{ github.workspace }}/dist-linux
+      ROOT_DIR: ${{ github.workspace }}/linux-root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply Linux tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version="$(bash scripts/linux/apply-release-version.sh "${GITHUB_REF_NAME}" CMakeLists.txt)"
+          echo "APP_VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Resolve Linux package version
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          version="$(sed -n 's/^project(EShot VERSION \([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -n1)"
+          test -n "$version"
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install Linux dependencies
+        # The runner's Azure Ubuntu mirror is sometimes extremely slow; use the
+        # main archive, retry dropped downloads and fail instead of hanging.
+        timeout-minutes: 20
+        run: |
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          echo 'Acquire::Retries "5";' | sudo tee /etc/apt/apt.conf.d/80-retries >/dev/null
+          echo 'Acquire::http::Timeout "30";' | sudo tee -a /etc/apt/apt.conf.d/80-retries >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            qt6-base-dev \
+            qt6-base-dev-tools \
+            qt6-qpa-plugins \
+            qt6-wayland \
+            libqt6svg6 \
+            libx11-dev \
+            libgl1-mesa-dev \
+            libxcb-cursor0 \
+            libxkbcommon-dev \
+            libsecret-1-dev \
+            desktop-file-utils \
+            appstream \
+            ffmpeg \
+            gstreamer1.0-tools \
+            gstreamer1.0-pipewire \
+            gstreamer1.0-pulseaudio \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            tesseract-ocr \
+            tesseract-ocr-eng \
+            xdg-desktop-portal \
+            xdg-desktop-portal-gtk \
+            xvfb \
+            xauth \
+            libegl1 \
+            libopengl0 \
+            libxkbcommon-x11-0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xkb1
+
+      - name: Validate Linux desktop metadata
+        run: |
+          desktop-file-validate packaging/linux/io.github.benoks.EShot.desktop
+          appstreamcli validate --no-net packaging/linux/io.github.benoks.EShot.metainfo.xml
+
+      - name: Configure
+        run: >
+          cmake -S . -B "${{ env.BUILD_DIR }}"
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build "${{ env.BUILD_DIR }}" --parallel
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir "${{ env.BUILD_DIR }}" --output-on-failure
+
+      - name: Install
+        run: >
+          cmake --install "${{ env.BUILD_DIR }}"
+          --prefix "${{ env.DIST_DIR }}"
+
+      - name: Validate installed Linux app metadata
+        run: |
+          rm -rf "${{ env.ROOT_DIR }}"
+          DESTDIR="${{ env.ROOT_DIR }}" cmake --install "${{ env.BUILD_DIR }}" --prefix /usr
+          desktop-file-validate "${{ env.ROOT_DIR }}/usr/share/applications/io.github.benoks.EShot.desktop"
+          appstreamcli validate-tree --no-net "${{ env.ROOT_DIR }}"
+
+      - name: Smoke test Linux binary
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ${{ env.DIST_DIR }}/bin/EShot --test-gif
+
+      # The tar.gz and .deb above use the distro Qt (6.2.4) they depend on.
+      # The AppImage bundles its own Qt, so it uses the official Qt release
+      # that Windows ships. Those binaries need glibc 2.28, so the 22.04
+      # runner keeps the AppImage's glibc 2.35 baseline. set-env is off so
+      # the distro Qt build and tests above are not affected.
+      - name: Install Qt for the AppImage
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          dir: ${{ github.workspace }}/qt-appimage
+          install-deps: 'false'
+          set-env: 'false'
+          cache: true
+
+      - name: Package Linux builds
+        run: |
+          bash scripts/linux/package-linux.sh
+          qt_qmake="$(find "${{ github.workspace }}/qt-appimage" -maxdepth 5 -path "*/${QT_VERSION}/*/bin/qmake" -type f | head -n1)"
+          test -n "${qt_qmake}"
+          ESHOT_APPIMAGE_QT_DIR="$(dirname "$(dirname "${qt_qmake}")")" bash scripts/linux/build-appimage.sh
+
+      - name: Smoke test AppImage
+        env:
+          ESHOT_SKIP_RUNTIME_SETUP: '1'
+        run: |
+          mkdir -p appimage-test-home
+          xvfb-run -a env HOME="$PWD/appimage-test-home" packages/EShot-v${APP_VERSION}-x86_64.AppImage --appimage-extract-and-run --test-gif
+
+      - name: Verify AppImage portability
+        run: bash scripts/linux/verify-appimage-portability.sh "packages/EShot-v${APP_VERSION}-x86_64.AppImage"
+
+      - name: Verify AppImage Qt runtime
+        run: bash scripts/linux/verify-appimage-qt.sh "packages/EShot-v${APP_VERSION}-x86_64.AppImage" "${QT_VERSION}"
+
+      - name: Inspect Linux packages
+        run: |
+          ls -lh packages
+          dpkg-deb --info packages/*.deb
+
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v4
+        with:
+          name: EShot-linux-x64
+          path: ${{ env.DIST_DIR }}
+          if-no-files-found: error
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: EShot-linux-packages
+          path: |
+            packages/*.AppImage
+            packages/*.deb
+            packages/*.tar.gz
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x64 build on the standard Windows runner
+          - arch: x64
+            runner: windows-latest
+            cmake_arch: x64
+            qt_arch: win64_msvc2022_64
+            # Pinned FFmpeg 8.1 GPL build (BtbN month-end autobuild, kept long
+            # term); includes ddagrab, libx264, NVENC, AMF and oneVPL (QSV).
+            ffmpeg_url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n8.1.3-9-g29e619e767-win64-gpl-8.1.zip'
+            ffmpeg_sha256: '7b801cdd3a1a0bb54ae6f572187e68b4ed54f52086cfee133fab2180bfb429fa'
+            # SHA-256 of EShot-v4.1.2-x64-portable.zip (Tesseract runtime source).
+            tesseract_sha256: '5de6f60e4272e411ed464d9b6a8d2d0806a8aee43bbeadcf9da29a4d440c5105'
+
+          # ARM64 build on the native Windows 11 Arm runner (FFmpeg is native Arm)
+          - arch: arm64
+            runner: windows-11-arm
+            cmake_arch: ARM64
+            qt_arch: win64_msvc2022_arm64_cross_compiled
+            # Same release; Arm64 has ddagrab, libx264 and AMF (no NVENC/QSV).
+            ffmpeg_url: 'https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n8.1.3-9-g29e619e767-winarm64-gpl-8.1.zip'
+            ffmpeg_sha256: '061a770557c30bbf8e0b6ca3810288a60f72b85088378b84be03277746f34f17'
+            # SHA-256 of EShot-v4.1.2-arm64-portable.zip (Tesseract runtime source).
+            tesseract_sha256: '0fa13174b46632524467f874c7c8d71326de90e044cfbf9bf9591ba348e927e3'
+
+    env:
+      BUILD_DIR: ${{ github.workspace }}/build
+      DIST_DIR: ${{ github.workspace }}/dist
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}' -replace '^[vV]', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Release tags must use vMAJOR.MINOR.PATCH, for example v3.0.5"
+          }
+
+          (Get-Content CMakeLists.txt -Raw) `
+            -replace 'project\(EShot VERSION \d+\.\d+\.\d+', "project(EShot VERSION $version" |
+            Set-Content CMakeLists.txt -NoNewline
+          (Get-Content packaging/windows/EShot_Setup.iss -Raw) `
+            -replace '#define MyAppVersion\s+"\d+\.\d+\.\d+"', "#define MyAppVersion   `"$version`"" |
+            Set-Content packaging/windows/EShot_Setup.iss -NoNewline
+
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Building release version $version"
+
+      - name: Resolve Windows build version
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        shell: pwsh
+        run: |
+          # Untagged builds use the CMake version, not a stale default.
+          $match = Select-String -Path CMakeLists.txt -Pattern 'project\(EShot VERSION (\d+\.\d+\.\d+)'
+          if (-not $match) { throw "Could not read the version from CMakeLists.txt" }
+          $version = $match.Matches[0].Groups[1].Value
+          (Get-Content packaging/windows/EShot_Setup.iss -Raw) `
+            -replace '#define MyAppVersion\s+"\d+\.\d+\.\d+"', "#define MyAppVersion   `"$version`"" |
+            Set-Content packaging/windows/EShot_Setup.iss -NoNewline
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Qt 6 (qtbase covers Core/Gui/Widgets/Network — no extra modules needed).
+      # The arm64 arch is Qt's cross-compiled WoA package; --autodesktop pulls in
+      # the companion x64 host Qt that provides the build/deploy tools (moc, rcc,
+      # windeployqt), which run on the Arm runner via emulation. The flag is a
+      # documented no-op for the x64 arch.
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: ${{ matrix.qt_arch }}
+          extra: --autodesktop
+          cache: true
+
+      # Stage the bundled third-party binaries into the locations CMake's
+      # EXISTS() checks look for, so they get copied + installed automatically.
+      # tessdata/*.traineddata is already committed under third_party/tesseract.
+      - name: Stage FFmpeg (${{ matrix.arch }}, native)
+        shell: pwsh
+        run: |
+          curl.exe -L --fail --retry 3 --retry-delay 5 -o ffmpeg.zip "${{ matrix.ffmpeg_url }}"
+          if ($LASTEXITCODE -ne 0) { throw "Could not download FFmpeg" }
+          $hash = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '${{ matrix.ffmpeg_sha256 }}') {
+            throw "FFmpeg archive checksum mismatch: $hash"
+          }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_extract -Force
+          $ffmpeg = @(Get-ChildItem -Recurse -File ffmpeg_extract -Filter ffmpeg.exe |
+            Where-Object { $_.Directory.Name -eq 'bin' })
+          if ($ffmpeg.Count -ne 1) { throw "Expected one bin/ffmpeg.exe in the FFmpeg archive" }
+          New-Item -ItemType Directory -Force third_party/ffmpeg/bin | Out-Null
+          # Only ffmpeg.exe is used; ffprobe/ffplay would just add size.
+          Copy-Item $ffmpeg[0].FullName third_party/ffmpeg/bin/ffmpeg.exe -Force
+
+      # Reuse the architecture-specific runtime already validated in v4.1.2.
+      # Actions caches created by tag builds are scoped to that tag, so compiling
+      # with vcpkg here would repeat the full Tesseract build for every release.
+      - name: Stage Tesseract (${{ matrix.arch }}, verified runtime)
+        shell: pwsh
+        run: |
+          $release = "${{ env.TESSERACT_RUNTIME_RELEASE }}"
+          $archive = "EShot-$release-${{ matrix.arch }}-portable.zip"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$release/$archive"
+          curl.exe -L --fail --retry 3 --retry-delay 5 -o tesseract-runtime.zip $url
+          if ($LASTEXITCODE -ne 0) { throw "Could not download $archive" }
+          # Pinned like FFmpeg: a replaced release asset must not be shipped.
+          $hash = (Get-FileHash tesseract-runtime.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne '${{ matrix.tesseract_sha256 }}') {
+            throw "Tesseract runtime checksum mismatch for ${archive}: $hash"
+          }
+          Expand-Archive tesseract-runtime.zip -DestinationPath tesseract-runtime -Force
+          $runtime = Get-ChildItem tesseract-runtime -Recurse -Directory |
+            Where-Object { Test-Path (Join-Path $_.FullName "tesseract.exe") } |
+            Select-Object -First 1
+          if (-not $runtime) { throw "Tesseract runtime not found in $archive" }
+          $dst = "third_party/tesseract"
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Copy-Item "$($runtime.FullName)\*" $dst -Recurse -Force
+          & "$dst\tesseract.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "Downloaded tesseract.exe failed to launch" }
+
+      # Let CMake pick the default (newest installed) Visual Studio generator
+      # and select the target arch with -A. We deliberately don't pin the
+      # generator version: the windows-latest image migrated to VS 2026 (gen
+      # "Visual Studio 18 2026") in June 2026, dropping VS 2022, while the
+      # windows-11-arm image still ships VS 2022 ("Visual Studio 17 2022").
+      # Omitting -G keeps both runners working across image migrations; -A is
+      # valid with any VS generator.
+      - name: Configure
+        run: >
+          cmake -S . -B "${{ env.BUILD_DIR }}"
+          -A ${{ matrix.cmake_arch }}
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build "${{ env.BUILD_DIR }}" --config Release --parallel
+
+      - name: Install
+        run: >
+          cmake --install "${{ env.BUILD_DIR }}"
+          --config Release
+          --prefix "${{ env.DIST_DIR }}"
+
+      - name: Verify Windows install policy
+        shell: pwsh
+        run: |
+          # The install policy unit tests run in the Linux job. Running them
+          # here would need the target Qt DLLs on PATH, which the Arm runner's
+          # cross-compiled Qt does not provide.
+          $exe = "${{ env.DIST_DIR }}/bin/EShot.exe"
+          $manifestPath = Join-Path $env:RUNNER_TEMP 'EShot.embedded.manifest'
+          # No vcvars env in this step, so mt.exe is not on PATH. Use the SDK copy.
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter mt.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.Directory.Name -eq 'x64' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $mt) { throw 'mt.exe was not found in the Windows SDK' }
+          & $mt.FullName "-inputresource:$exe;#1" "-out:$manifestPath"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the embedded manifest' }
+          [xml]$manifest = Get-Content $manifestPath -Raw
+          $level = $manifest.SelectSingleNode("//*[local-name()='requestedExecutionLevel']")
+          if (-not $level -or $level.GetAttribute('level') -ne 'asInvoker') {
+            throw 'EShot.exe must run without administrator elevation'
+          }
+
+      # Bundle the Qt runtime + the MSVC redistributable DLLs next to the exe so
+      # the artifact (and installer) is self-contained.
+      #
+      # For the cross-compiled arm64 Qt, windeployqt is not in the target's bin
+      # (it's a host-only x64 tool installed by --autodesktop). We locate it and
+      # point it at the target Qt via --qtpaths so it deploys arm64 DLLs, per
+      # Qt's documented cross-deployment flow.
+      - name: Deploy Qt runtime
+        shell: pwsh
+        run: |
+          $exe   = "${{ env.DIST_DIR }}/bin/EShot.exe"
+          $qtBin = Join-Path $env:QT_ROOT_DIR 'bin'
+          $wdq   = Join-Path $qtBin 'windeployqt.exe'
+          $extra = @()
+
+          if (-not (Test-Path $wdq)) {
+            # Cross build: find the host windeployqt under the autodesktop Qt.
+            $verRoot = Split-Path $env:QT_ROOT_DIR -Parent
+            $wdq = (Get-ChildItem $verRoot -Recurse -Filter windeployqt.exe |
+                    Select-Object -First 1).FullName
+            if (-not $wdq) { throw "windeployqt.exe not found under $verRoot" }
+
+            # The target bin ships qtpaths as a .bat wrapper that invokes the
+            # host x64 qtpaths with -qtconf target_qt.conf (so it reports arm64
+            # paths). windeployqt accepts the .bat and deploys arm64 DLLs.
+            $qtpaths = Get-ChildItem $qtBin -Filter 'qtpaths6.bat' |
+                       Select-Object -First 1
+            if (-not $qtpaths) { throw "target qtpaths6.bat not found in $qtBin" }
+            $extra = @('--qtpaths', $qtpaths.FullName)
+          }
+
+          Write-Host "Using $wdq $extra"
+          & $wdq --release --no-translations @extra $exe
+
+          $svgRuntime = @(
+            "${{ env.DIST_DIR }}/bin/Qt6Svg.dll",
+            "${{ env.DIST_DIR }}/bin/imageformats/qsvg.dll",
+            "${{ env.DIST_DIR }}/bin/iconengines/qsvgicon.dll"
+          )
+          foreach ($file in $svgRuntime) {
+            if (-not (Test-Path $file)) { throw "Missing SVG runtime: $file" }
+          }
+
+      # windeployqt doesn't reliably deploy the loose MSVC CRT DLLs in CI: on
+      # arm64 it emits vc_redist.arm64.exe instead, and on x64 it skips them when
+      # it can't locate the redist (no vcvars env in this step). Copy the matching
+      # arch's MSVC runtime next to the exe so the app-local layout — and the
+      # installer — is complete on both architectures. (matrix.arch values "x64"
+      # and "arm64" match the VS redist folder names.)
+      - name: Bundle MSVC runtime
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $crt = Get-ChildItem -Path "$vs\VC\Redist\MSVC" -Recurse -Directory -Filter 'Microsoft.VC*.CRT' |
+                 Where-Object { $_.FullName -match '\\${{ matrix.arch }}\\' } |
+                 Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "${{ matrix.arch }} MSVC CRT redist not found under $vs" }
+          Write-Host "Copying CRT from $($crt.FullName)"
+          Copy-Item "$($crt.FullName)\*.dll" "${{ env.DIST_DIR }}/bin/" -Force
+          # The redist bootstrapper isn't needed once the DLLs are app-local.
+          Remove-Item "${{ env.DIST_DIR }}/bin/vc_redist.*.exe" -ErrorAction SilentlyContinue
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: EShot-${{ matrix.arch }}
+          path: ${{ env.DIST_DIR }}/bin
+          if-no-files-found: error
+
+      - name: Verify legacy startup migration
+        shell: pwsh
+        run: |
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          $previous = (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).EShot
+          $exe = 'C:\Program Files\EShot\EShot.exe'
+          try {
+            function Get-ScheduledTask {
+              [CmdletBinding()]
+              param([string]$TaskName)
+              [pscustomobject]@{
+                Principal = [pscustomobject]@{ UserId = $global:taskUserId }
+                Actions = @([pscustomobject]@{ Execute = 'C:\Old\EShot.exe' })
+              }
+            }
+            function Unregister-ScheduledTask {
+              [CmdletBinding(SupportsShouldProcess)]
+              param([string]$TaskName)
+              if ($TaskName -eq 'EShot') { $global:removedTask = $true }
+            }
+            # Task Scheduler reports local principals with or without the
+            # machine prefix; both forms must be recognised as this user.
+            $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+            foreach ($userId in @($identity.Name, $env:USERNAME, $identity.User.Value)) {
+              $global:taskUserId = $userId
+              $global:removedTask = $false
+              Remove-ItemProperty -Path $runKey -Name 'EShot' -ErrorAction SilentlyContinue
+              & ./scripts/windows/migrate-startup.ps1 -Exe $exe -RemoveTask
+              $actual = (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).EShot
+              if ($actual -ne ('"' + $exe + '" --silent')) {
+                throw "Legacy startup migration wrote an incorrect command for ${userId}: $actual"
+              }
+              if (-not $global:removedTask) { throw "Legacy task was not removed for $userId" }
+            }
+          } finally {
+            if ($null -eq $previous) {
+              Remove-ItemProperty -Path $runKey -Name 'EShot' -ErrorAction SilentlyContinue
+            } else {
+              Set-ItemProperty -Path $runKey -Name 'EShot' -Value $previous
+            }
+          }
+
+      # Build the Inno Setup installer from the assembled dist/bin tree.
+      # ISCC is x86; on the Arm runner it runs under emulation and still
+      # packages the native Arm payload. /F overrides the output basename so
+      # the two arch installers don't collide.
+      - name: Build installer
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DReleaseDir=${{ env.DIST_DIR }}\bin" `
+            "/DArch=${{ matrix.arch }}" `
+            "/FEShot_Setup_v${{ env.APP_VERSION }}_${{ matrix.arch }}" `
+            packaging/windows/EShot_Setup.iss
+
+      - name: Smoke test per-user installer
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path "installer_output/EShot_Setup_v${{ env.APP_VERSION }}_${{ matrix.arch }}.exe").Path
+          $result = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/CURRENTUSER', '/TASKS=startupicon', '/NORESTART') -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Per-user installation failed: $($result.ExitCode)" }
+
+          $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{E5H0T-SCAP-2024-GUID-000000000001}_is1'
+          $installLocation = (Get-ItemProperty $uninstallKey).InstallLocation
+          $installedExe = Join-Path $installLocation 'EShot.exe'
+          if (-not (Test-Path $installedExe)) { throw 'EShot was not installed for the current user' }
+
+          $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          $startup = (Get-ItemProperty $runKey).EShot
+          $expectedStartup = '"' + $installedExe + '" --silent'
+          if ($startup -ne $expectedStartup) { throw "Incorrect per-user startup entry: $startup" }
+
+          $uninstaller = Join-Path $installLocation 'unins000.exe'
+          $result = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT' -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Per-user uninstall failed: $($result.ExitCode)" }
+          if ((Get-ItemProperty $runKey -ErrorAction SilentlyContinue).EShot) {
+            throw 'Uninstall left behind the per-user startup entry'
+          }
+
+          # Startup is unchecked by default. The Settings dialog can enable it
+          # later, so uninstall must also clean that independently created value.
+          $result = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/CURRENTUSER', '/TASKS=desktopicon', '/NORESTART') -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Default per-user installation failed: $($result.ExitCode)" }
+          $installLocation = (Get-ItemProperty $uninstallKey).InstallLocation
+          $installedExe = Join-Path $installLocation 'EShot.exe'
+          Set-ItemProperty -Path $runKey -Name 'EShot' -Value ('"' + $installedExe + '" --silent')
+          $uninstaller = Join-Path $installLocation 'unins000.exe'
+          $result = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT' -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Default per-user uninstall failed: $($result.ExitCode)" }
+          if ((Get-ItemProperty $runKey -ErrorAction SilentlyContinue).EShot) {
+            throw 'Uninstall left behind startup enabled later in Settings'
+          }
+
+          # Uninstall must not erase another copy's startup value, even if the
+          # installer originally created this one with startupicon selected.
+          $result = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/CURRENTUSER', '/TASKS=startupicon', '/NORESTART') -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Per-user reinstallation failed: $($result.ExitCode)" }
+          $installLocation = (Get-ItemProperty $uninstallKey).InstallLocation
+          $foreignStartup = '"C:\Other\EShot.exe" --silent'
+          Set-ItemProperty -Path $runKey -Name 'EShot' -Value $foreignStartup
+          $uninstaller = Join-Path $installLocation 'unins000.exe'
+          $result = Start-Process -FilePath $uninstaller -ArgumentList '/VERYSILENT' -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Per-user reinstallation uninstall failed: $($result.ExitCode)" }
+          if ((Get-ItemProperty $runKey).EShot -ne $foreignStartup) {
+            throw 'Uninstall removed another EShot copy startup entry'
+          }
+          Remove-ItemProperty -Path $runKey -Name 'EShot'
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EShot-Setup-${{ matrix.arch }}
+          path: installer_output/*.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - linux-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release notes
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Package portable builds
+        shell: bash
+        run: |
+          cd release-assets/EShot-x64
+          zip -r ../EShot-${{ github.ref_name }}-x64-portable.zip .
+          cd ../EShot-arm64
+          zip -r ../EShot-${{ github.ref_name }}-arm64-portable.zip .
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: packaging/release-notes/${{ github.ref_name }}.md
+          files: |
+            release-assets/EShot-Setup-x64/*.exe
+            release-assets/EShot-Setup-arm64/*.exe
+            release-assets/EShot-${{ github.ref_name }}-x64-portable.zip
+            release-assets/EShot-${{ github.ref_name }}-arm64-portable.zip
+            release-assets/EShot-linux-packages/EShot-${{ github.ref_name }}-x86_64.AppImage
+            release-assets/EShot-linux-packages/EShot-${{ github.ref_name }}-linux-x64.tar.gz

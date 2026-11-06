@@ -1,0 +1,466 @@
+#include "CaptureInteractionPolicy.h"
+
+#include <QLineF>
+
+#include <cmath>
+
+bool shouldReleaseToolForResize(bool handleHit, int currentTool, int noneTool)
+{
+    return handleHit && currentTool != noneTool;
+}
+
+int initialAnnotationTool(bool rememberLastTool, int storedTool, int noneTool)
+{
+    return rememberLastTool ? storedTool : noneTool;
+}
+
+bool shouldShowCaptureHints(bool enabled, bool selecting, bool selectionComplete,
+                            bool eyedropperActive)
+{
+    return enabled && !selecting && !selectionComplete && !eyedropperActive;
+}
+
+QRect captureHintRect(const QRect &monitorRect, const QSize &preferredSize)
+{
+    if (!monitorRect.isValid() || preferredSize.isEmpty())
+        return {};
+
+    constexpr int HorizontalMargin = 16;
+    constexpr int TopMargin = 24;
+    const int width = qMin(preferredSize.width(),
+                           qMax(0, monitorRect.width() - HorizontalMargin * 2));
+    const int height = qMin(preferredSize.height(), monitorRect.height());
+    const int x = monitorRect.left() + (monitorRect.width() - width) / 2;
+    const int y = monitorRect.top() + qMin(TopMargin, qMax(0, monitorRect.height() - height));
+    return QRect(x, y, width, height);
+}
+
+QRect selectionUiMonitorRect(const QRect &selection, const QList<QRect> &monitors,
+                            const QRect &fallback)
+{
+    if (!selection.isValid())
+        return fallback;
+    for (const QRect &monitor : monitors) {
+        if (monitor.isValid() && monitor.contains(selection.center()))
+            return monitor;
+    }
+    // The selection centre can fall in a desktop gap. Prefer the output
+    // containing most of the selection, keeping the previous output on ties.
+    QRect result = fallback;
+    qint64 largestArea = 0;
+    for (const QRect &monitor : monitors) {
+        const QRect overlap = monitor.intersected(selection);
+        if (!overlap.isValid())
+            continue;
+        const qint64 area = qint64(overlap.width()) * overlap.height();
+        if (area > largestArea || (area == largestArea && monitor == fallback)) {
+            largestArea = area;
+            result = monitor;
+        }
+    }
+    return result;
+}
+
+int quickSettingsTabHeight(int textWidth, int availableHeight)
+{
+    constexpr int MinimumHeight = 118;
+    constexpr int TextPadding = 32;
+    constexpr int ScreenMargins = 64;
+    const int preferredHeight = qMax(MinimumHeight, qMax(0, textWidth) + TextPadding);
+    const int maximumHeight = qMax(28, availableHeight - ScreenMargins);
+    return qMin(preferredHeight, maximumHeight);
+}
+
+ManagedProxyKeyDestination managedProxyKeyDestination(bool textEditorVisible,
+                                                      bool overlayInputActive)
+{
+    if (overlayInputActive)
+        return ManagedProxyKeyDestination::OverlayInput;
+    if (textEditorVisible)
+        return ManagedProxyKeyDestination::TextEditor;
+    return ManagedProxyKeyDestination::CaptureOverlay;
+}
+
+bool isManagedProxyInputSource(bool proxyWidget, bool proxyWindow)
+{
+    return proxyWidget || proxyWindow;
+}
+
+int overlayEditorIndexAt(const QList<QRect> &editorRects, const QPoint &globalPosition)
+{
+    for (qsizetype index = 0; index < editorRects.size(); ++index) {
+        if (editorRects.at(index).contains(globalPosition))
+            return static_cast<int>(index);
+    }
+    return -1;
+}
+
+bool shouldSelectOverlayEditorOnPointerPress(bool editorUnderPointer)
+{
+    return editorUnderPointer;
+}
+
+bool shouldRestoreCaptureKeyboardFocus(bool overlayVisible, bool selectionComplete,
+                                       bool textEditorVisible)
+{
+    return overlayVisible && selectionComplete && !textEditorVisible;
+}
+
+bool shouldGrabCaptureKeyboardFromManagedProxy(bool managedProxyAvailable,
+                                               bool overlayVisible, bool selectionComplete,
+                                               bool textEditorVisible)
+{
+    return managedProxyAvailable
+        && shouldRestoreCaptureKeyboardFocus(overlayVisible, selectionComplete,
+                                             textEditorVisible);
+}
+
+bool shouldActivateManagedProxyOnPresent(bool managedProxyAvailable,
+                                         bool nativeScreenViewsActive)
+{
+    return managedProxyAvailable && !nativeScreenViewsActive;
+}
+
+CaptureActivationAction captureActivationAction(qint64 elapsedMs, bool proxyActive,
+                                                bool inputSeen,
+                                                bool compositorActivationRequested,
+                                                bool compositorActivationAvailable)
+{
+    if (proxyActive || inputSeen)
+        return CaptureActivationAction::None;
+    if (elapsedMs >= CaptureInputBannerMs)
+        return CaptureActivationAction::ShowInputBlockedBanner;
+    if (elapsedMs >= CaptureActivationCheckMs && !compositorActivationRequested
+        && compositorActivationAvailable) {
+        return CaptureActivationAction::RequestCompositorActivation;
+    }
+    return CaptureActivationAction::None;
+}
+
+QString applyWindowTitleToken(const QString &pattern, const QString &title)
+{
+    const QString token = QStringLiteral("%T");
+    QString result = pattern;
+    if (!title.isEmpty())
+        return result.replace(token, title);
+    const QString separators = QStringLiteral(" _-.");
+    qsizetype index = result.indexOf(token);
+    while (index >= 0) {
+        qsizetype start = index;
+        qsizetype end = index + token.size();
+        if (start > 0 && separators.contains(result.at(start - 1)))
+            --start;
+        else if (end < result.size() && separators.contains(result.at(end)))
+            ++end;
+        result.remove(start, end - start);
+        index = result.indexOf(token, start);
+    }
+    return result;
+}
+
+WindowsCapturePlan windowsCapturePlan(bool exclusiveFullscreen)
+{
+    WindowsCapturePlan plan;
+    plan.preferDuplication = exclusiveFullscreen;
+    plan.takeForeground = !exclusiveFullscreen;
+    return plan;
+}
+
+bool shouldDetachModalFromOverlay(bool xwaylandOverlay)
+{
+    return xwaylandOverlay;
+}
+
+QPoint cornerResizeTopLeft(const QRect &startGeometry, const QSize &newSize,
+                           bool dragLeft, bool dragTop)
+{
+    const int x = dragLeft ? startGeometry.x() + startGeometry.width() - newSize.width()
+                           : startGeometry.x();
+    const int y = dragTop ? startGeometry.y() + startGeometry.height() - newSize.height()
+                          : startGeometry.y();
+    return QPoint(x, y);
+}
+
+bool shouldComposeCaptureResult(bool recordingMode)
+{
+    return !recordingMode;
+}
+
+bool shouldUsePartialOverlayUpdates(qreal devicePixelRatio)
+{
+    // At fractional scales Qt rounds logical dirty rects to device pixels,
+    // and some Wayland stacks then leave stale crosshair/frame lines on
+    // screen. Partial updates are only safe on whole-pixel scales.
+    return devicePixelRatio > 0.0
+        && qFuzzyCompare(devicePixelRatio, std::round(devicePixelRatio));
+}
+
+bool shouldRepaintCrosshairOnMove(const QString &crosshairStyle)
+{
+    return crosshairStyle != QLatin1String("none");
+}
+
+QRegion crosshairUpdateRegion(const QPoint &previousPosition,
+                              const QPoint &currentPosition,
+                              const QRect &canvasRect)
+{
+    if (!canvasRect.isValid())
+        return {};
+
+    constexpr int CrosshairRepaintMargin = 2;
+    const int lineExtent = CrosshairRepaintMargin * 2 + 1;
+    QRegion dirty;
+    const QPoint positions[] = {previousPosition, currentPosition};
+    for (const QPoint &position : positions) {
+        dirty += QRect(position.x() - CrosshairRepaintMargin,
+                       canvasRect.top(), lineExtent, canvasRect.height())
+                     .intersected(canvasRect);
+        dirty += QRect(canvasRect.left(),
+                       position.y() - CrosshairRepaintMargin,
+                       canvasRect.width(), lineExtent)
+                     .intersected(canvasRect);
+    }
+    return dirty;
+}
+
+QRegion selectionUpdateRegion(const QRect &previousSelection,
+                              const QRect &currentSelection,
+                              const QRect &canvasRect)
+{
+    if (!canvasRect.isValid())
+        return {};
+
+    auto clippedSelection = [&canvasRect](const QRect &selection) {
+        return selection.normalized().intersected(canvasRect);
+    };
+    auto outline = [](const QRect &rect) {
+        if (!rect.isValid())
+            return QRegion();
+        // The selection frame is 2 px wide and its corner handles extend
+        // 5 px beyond the rectangle. Keep an extra pixel for rasterization.
+        constexpr int BorderMargin = 7;
+        const QRect outer = rect.adjusted(-BorderMargin, -BorderMargin,
+                                          BorderMargin, BorderMargin);
+        const QRect inner = rect.adjusted(BorderMargin, BorderMargin,
+                                          -BorderMargin, -BorderMargin);
+        return QRegion(outer) - QRegion(inner);
+    };
+    auto sizeLabelArea = [&canvasRect](const QRect &rect) {
+        if (!rect.isValid())
+            return QRect();
+        constexpr int LabelWidth = 200;
+        constexpr int LabelHeight = 52;
+        const int labelY = rect.top() - LabelHeight >= canvasRect.top()
+            ? rect.top() - LabelHeight : rect.top();
+        return QRect(rect.left() - 4, labelY, LabelWidth, LabelHeight)
+            .intersected(canvasRect);
+    };
+
+    const QRect previous = clippedSelection(previousSelection);
+    const QRect current = clippedSelection(currentSelection);
+    QRegion dirty = QRegion(previous).xored(QRegion(current));
+    dirty += outline(previous).intersected(canvasRect);
+    dirty += outline(current).intersected(canvasRect);
+    dirty += sizeLabelArea(previous);
+    dirty += sizeLabelArea(current);
+    return dirty;
+}
+
+QRegion selectionStartUpdateRegion(const QRect &currentSelection,
+                                   const QRect &canvasRect,
+                                   const QRect &dismissedUiRect)
+{
+    QRegion dirty = selectionUpdateRegion(QRect(), currentSelection, canvasRect);
+    dirty += dismissedUiRect.intersected(canvasRect);
+    return dirty;
+}
+
+SelectionResizeHandle selectionResizeHandleAt(const QRect &selection,
+                                              const QPoint &position,
+                                              int hitRadius)
+{
+    const QRect rect = selection.normalized();
+    if (!rect.isValid())
+        return SelectionResizeHandle::NewSelection;
+
+    const auto isNear = [position](const QPoint &handle, int radius) {
+        return QLineF(position, handle).length() <= radius;
+    };
+
+    if (isNear(rect.topLeft(), hitRadius))
+        return SelectionResizeHandle::TopLeft;
+    if (isNear(rect.topRight(), hitRadius))
+        return SelectionResizeHandle::TopRight;
+    if (isNear(rect.bottomRight(), hitRadius))
+        return SelectionResizeHandle::BottomRight;
+    if (isNear(rect.bottomLeft(), hitRadius))
+        return SelectionResizeHandle::BottomLeft;
+    constexpr int EdgeHandleExtraHitRadius = 4;
+    const int edgeHitRadius = hitRadius + EdgeHandleExtraHitRadius;
+    if (isNear(QPoint(rect.center().x(), rect.top()), edgeHitRadius))
+        return SelectionResizeHandle::Top;
+    if (isNear(QPoint(rect.right(), rect.center().y()), edgeHitRadius))
+        return SelectionResizeHandle::Right;
+    if (isNear(QPoint(rect.center().x(), rect.bottom()), edgeHitRadius))
+        return SelectionResizeHandle::Bottom;
+    if (isNear(QPoint(rect.left(), rect.center().y()), edgeHitRadius))
+        return SelectionResizeHandle::Left;
+    if (rect.contains(position))
+        return SelectionResizeHandle::Move;
+    return SelectionResizeHandle::NewSelection;
+}
+
+QRect resizedSelectionForHandle(const QRect &selection,
+                                SelectionResizeHandle handle,
+                                const QPoint &position)
+{
+    QRect result = selection.normalized();
+    switch (handle) {
+    case SelectionResizeHandle::Top:
+        result.setTop(position.y());
+        break;
+    case SelectionResizeHandle::Right:
+        result.setRight(position.x());
+        break;
+    case SelectionResizeHandle::Bottom:
+        result.setBottom(position.y());
+        break;
+    case SelectionResizeHandle::Left:
+        result.setLeft(position.x());
+        break;
+    default:
+        break;
+    }
+    return result.normalized();
+}
+
+namespace {
+qreal alignedSelectionFrameCoordinate(qreal coordinate, qreal devicePixelRatio)
+{
+    const qreal scale = devicePixelRatio > 0.0 ? devicePixelRatio : 1.0;
+    return qRound(coordinate * scale) / scale;
+}
+}
+
+SelectionFrameSegments selectionFrameSegments(const QRect &selection, qreal devicePixelRatio)
+{
+    SelectionFrameSegments segments;
+    const QRect rect = selection.normalized();
+    if (!rect.isValid())
+        return segments;
+
+    const qreal scale = devicePixelRatio > 0.0 ? devicePixelRatio : 1.0;
+    const qreal left = alignedSelectionFrameCoordinate(rect.left(), scale);
+    const qreal top = alignedSelectionFrameCoordinate(rect.top(), scale);
+    const qreal right = alignedSelectionFrameCoordinate(rect.right(), scale);
+    const qreal bottom = alignedSelectionFrameCoordinate(rect.bottom(), scale);
+    const qreal thickness = 1.0 / scale;
+
+    segments.thickness = thickness;
+    segments.top = QRectF(left, top, right - left + thickness, thickness);
+    segments.right = QRectF(right, top, thickness, bottom - top + thickness);
+    segments.bottom = QRectF(left, bottom, right - left + thickness, thickness);
+    segments.left = QRectF(left, top, thickness, bottom - top + thickness);
+    return segments;
+}
+
+QPointF selectionFrameHandleCenter(const QRect &selection, SelectionResizeHandle handle,
+                                   qreal devicePixelRatio)
+{
+    const QRect rect = selection.normalized();
+    if (!rect.isValid())
+        return {};
+
+    const SelectionFrameSegments segments = selectionFrameSegments(rect, devicePixelRatio);
+    const qreal horizontalCenter = alignedSelectionFrameCoordinate(
+        (rect.left() + rect.right()) / 2.0, devicePixelRatio);
+    const qreal verticalCenter = alignedSelectionFrameCoordinate(
+        (rect.top() + rect.bottom()) / 2.0, devicePixelRatio);
+
+    switch (handle) {
+    case SelectionResizeHandle::TopLeft: return {segments.left.x(), segments.top.y()};
+    case SelectionResizeHandle::Top: return {horizontalCenter, segments.top.y()};
+    case SelectionResizeHandle::TopRight: return {segments.right.x(), segments.top.y()};
+    case SelectionResizeHandle::Right: return {segments.right.x(), verticalCenter};
+    case SelectionResizeHandle::BottomRight: return {segments.right.x(), segments.bottom.y()};
+    case SelectionResizeHandle::Bottom: return {horizontalCenter, segments.bottom.y()};
+    case SelectionResizeHandle::BottomLeft: return {segments.left.x(), segments.bottom.y()};
+    case SelectionResizeHandle::Left: return {segments.left.x(), verticalCenter};
+    default: return {};
+    }
+}
+
+QRegion selectionFrameClipRegion(const QRect &selection, const QRect &canvasRect)
+{
+    QRegion clip(canvasRect);
+    const QRect rect = selection.normalized();
+    if (!rect.isValid())
+        return clip;
+
+    const auto excludeHandle = [&clip](const QPoint &center, const QSize &size) {
+        const QRect handle(center - QPoint(size.width() / 2, size.height() / 2), size);
+        clip -= handle.adjusted(-1, -1, 1, 1);
+    };
+    excludeHandle(rect.topLeft(), QSize(10, 10));
+    excludeHandle(QPoint(rect.center().x(), rect.top()), QSize(10, 4));
+    excludeHandle(rect.topRight(), QSize(10, 10));
+    excludeHandle(QPoint(rect.right(), rect.center().y()), QSize(4, 10));
+    excludeHandle(rect.bottomRight(), QSize(10, 10));
+    excludeHandle(QPoint(rect.center().x(), rect.bottom()), QSize(10, 4));
+    excludeHandle(rect.bottomLeft(), QSize(10, 10));
+    excludeHandle(QPoint(rect.left(), rect.center().y()), QSize(4, 10));
+    return clip;
+}
+
+SelectionNudge selectionNudgeForKey(int key, Qt::KeyboardModifiers modifiers)
+{
+    SelectionNudge nudge;
+    // Keypad arrows carry KeypadModifier; Alt and Meta combinations are left
+    // to the desktop and to user-defined shortcuts.
+    const Qt::KeyboardModifiers relevant = modifiers
+        & (Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier | Qt::MetaModifier);
+    if (relevant & (Qt::AltModifier | Qt::MetaModifier))
+        return nudge;
+    const int step = (relevant & Qt::ShiftModifier) ? 10 : 1;
+    switch (key) {
+    case Qt::Key_Left: nudge.delta = QPoint(-step, 0); break;
+    case Qt::Key_Right: nudge.delta = QPoint(step, 0); break;
+    case Qt::Key_Up: nudge.delta = QPoint(0, -step); break;
+    case Qt::Key_Down: nudge.delta = QPoint(0, step); break;
+    default: return nudge;
+    }
+    nudge.valid = true;
+    nudge.mode = (relevant & Qt::ControlModifier) ? SelectionNudgeMode::Resize
+                                                  : SelectionNudgeMode::Move;
+    return nudge;
+}
+
+QRect nudgedSelection(const QRect &selection, SelectionNudgeMode mode,
+                      const QPoint &delta, const QRect &bounds)
+{
+    const QRect rect = selection.normalized();
+    if (!rect.isValid() || !bounds.isValid())
+        return rect;
+
+    if (mode == SelectionNudgeMode::Move) {
+        // Same clamp as a mouse move; the qMax guard keeps a selection
+        // larger than the bounds from inverting the range.
+        const int maxX = qMax(bounds.left(), bounds.right() - rect.width() + 1);
+        const int maxY = qMax(bounds.top(), bounds.bottom() - rect.height() + 1);
+        const QPoint topLeft(qBound(bounds.left(), rect.left() + delta.x(), maxX),
+                             qBound(bounds.top(), rect.top() + delta.y(), maxY));
+        return QRect(topLeft, rect.size());
+    }
+
+    // Resize moves the right/bottom edge, keeping at least 1x1 pixel.
+    QRect result = rect;
+    if (delta.x()) {
+        const int maxRight = qMax(rect.left(), bounds.right());
+        result.setRight(qBound(rect.left(), rect.right() + delta.x(), maxRight));
+    }
+    if (delta.y()) {
+        const int maxBottom = qMax(rect.top(), bounds.bottom());
+        result.setBottom(qBound(rect.top(), rect.bottom() + delta.y(), maxBottom));
+    }
+    return result;
+}

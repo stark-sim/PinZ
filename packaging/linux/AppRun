@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+appdir="${APPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+source "${appdir}/usr/lib/eshot/runtime-common.sh"
+
+installed_appimage="$(eshot_installed_appimage_path)"
+desktop_file="$(eshot_desktop_file_path)"
+data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+installed_icon="${data_home}/icons/hicolor/scalable/apps/io.github.benoks.EShot.svg"
+installed_versioned_icon="${data_home}/icons/hicolor/scalable/apps/io.github.benoks.EShot-v4.svg"
+installed_pixmap="${data_home}/pixmaps/io.github.benoks.EShot.svg"
+installed_versioned_pixmap="${data_home}/pixmaps/io.github.benoks.EShot-v4.svg"
+
+install_desktop_entry() {
+  local source_desktop="${appdir}/usr/share/applications/io.github.benoks.EShot.desktop"
+  local escaped_path="${installed_appimage//\\/\\\\}"
+  escaped_path="${escaped_path//\"/\\\"}"
+
+  mkdir -p "$(dirname "${desktop_file}")" \
+    "$(dirname "${installed_icon}")" \
+    "$(dirname "${installed_pixmap}")"
+  awk -v executable="${escaped_path}" '
+    /^Exec=eshot-launcher/ {
+      args = substr($0, length("Exec=eshot-launcher") + 1)
+      print "Exec=/usr/bin/env ESHOT_DESKTOP_LAUNCH=1 \"" executable "\"" args
+      next
+    }
+    { print }
+  ' "${source_desktop}" >"${desktop_file}.new"
+  mv -f -- "${desktop_file}.new" "${desktop_file}"
+  chmod 0644 "${desktop_file}"
+  cp -f -- "${appdir}/usr/share/icons/hicolor/scalable/apps/io.github.benoks.EShot.svg" "${installed_icon}"
+  cp -f -- "${appdir}/usr/share/icons/hicolor/scalable/apps/io.github.benoks.EShot-v4.svg" "${installed_versioned_icon}"
+  cp -f -- "${appdir}/usr/share/icons/hicolor/scalable/apps/io.github.benoks.EShot.svg" "${installed_pixmap}"
+  cp -f -- "${appdir}/usr/share/icons/hicolor/scalable/apps/io.github.benoks.EShot-v4.svg" "${installed_versioned_pixmap}"
+  chmod 0644 "${installed_icon}"
+  chmod 0644 "${installed_versioned_icon}" "${installed_pixmap}" "${installed_versioned_pixmap}"
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$(dirname "${desktop_file}")" >/dev/null 2>&1 || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "${data_home}/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+  if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+  fi
+}
+
+integrate_appimage() {
+  if [[ -z "${APPIMAGE:-}" || ! -f "${APPIMAGE}" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${installed_appimage}")"
+  if [[ "$(readlink -f "${APPIMAGE}")" != "$(readlink -m "${installed_appimage}")" ]]; then
+    cp -f -- "${APPIMAGE}" "${installed_appimage}.new"
+    chmod 0755 "${installed_appimage}.new"
+    mv -f -- "${installed_appimage}.new" "${installed_appimage}"
+  else
+    chmod 0755 "${installed_appimage}"
+  fi
+  install_desktop_entry
+}
+
+if [[ "${1:-}" == "--integrate-only" ]]; then
+  integrate_appimage
+  exit 0
+fi
+
+# --uninstall is handled by EShot itself: restoring Print Screen needs
+# gsettings and KDE's D-Bus API, so it is passed through like other options.
+
+eshot_configure_overlay_backend
+
+export ESHOT_APPDIR="${appdir}"
+# EShot starts through autostart. Without this the session manager saves the
+# per-launch /tmp/.mount_* path and fails to restore it at the next login.
+unset SESSION_MANAGER
+exec "${appdir}/usr/bin/EShot" "$@"

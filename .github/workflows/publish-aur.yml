@@ -1,0 +1,69 @@
+name: Publish AUR package
+
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v4.0.9
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       (startsWith(github.event.workflow_run.head_branch, 'refs/tags/v') ||
+        startsWith(github.event.workflow_run.head_branch, 'v'))) ||
+      (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        run: pacman -Syu --noconfirm base-devel curl git openssh
+
+      - name: Configure AUR SSH access
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 /root/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > /root/.ssh/id_ed25519
+          chmod 600 /root/.ssh/id_ed25519
+          ssh-keyscan aur.archlinux.org > /root/.ssh/known_hosts
+          chmod 644 /root/.ssh/known_hosts
+
+      - name: Publish eshot-bin
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_branch }}
+        run: |
+          version="${TAG#v}"
+          appimage="EShot-v${version}-x86_64.AppImage"
+          curl --fail --location --retry 3 \
+            --output "/tmp/${appimage}" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${appimage}"
+          checksum="$(sha256sum "/tmp/${appimage}" | awk '{print $1}')"
+
+          git clone ssh://aur@aur.archlinux.org/eshot-bin.git aur
+          cp packaging/aur/eshot-bin/PKGBUILD packaging/aur/eshot-bin/eshot aur/
+          bash scripts/linux/update-aur-package.sh "${version}" "${checksum}" aur
+          useradd -m builder
+          chown -R builder:builder aur
+          runuser -u builder -- sh -c 'cd aur && makepkg --printsrcinfo > .SRCINFO'
+          chown -R root:root aur
+          (
+            cd aur
+            git config user.name 'EShot release automation'
+            git config user.email 'github-actions[bot]@users.noreply.github.com'
+            git add PKGBUILD .SRCINFO eshot
+            git diff --cached --quiet || git commit -m "Update to ${version}"
+            git push
+          )

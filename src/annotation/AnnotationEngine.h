@@ -1,0 +1,241 @@
+#ifndef ANNOTATIONENGINE_H
+#define ANNOTATIONENGINE_H
+
+#include <QObject>
+#include <QPoint>
+#include <QRect>
+#include <QColor>
+#include <QVector>
+#include <QHash>
+#include <QPixmap>
+#include <QString>
+#include <QFont>
+
+#include "CounterGeometry.h"
+
+class AnnotationEngine : public QObject {
+    Q_OBJECT
+
+public:
+    enum Tool {
+        None = 0,
+        Pen,
+        Arrow,
+        Rectangle,
+        Circle,
+        Text,
+        Blur,
+        Highlighter,
+        Counter,
+        Eraser,
+        Line,
+        SemiRect,
+        // Appended so tool ids stored in settings keep their meaning.
+        Pixelate
+    };
+    Q_ENUM(Tool)
+
+    // How a text label is set off from the screenshot behind it.
+    enum TextBackground {
+        TextBox = 0,     // translucent dark box (original look)
+        TextPlain,       // text only
+        TextOutline      // text with a dark outline, readable on any colour
+    };
+
+    struct TextStyle {
+        QString fontFamily;
+        int fontSize = 18;
+        QColor color;
+        bool bold = true;
+        TextBackground background = TextBox;
+    };
+
+    explicit AnnotationEngine(QObject *parent = nullptr);
+    ~AnnotationEngine();
+
+    void setCurrentTool(Tool tool);
+    Tool currentTool() const { return m_currentTool; }
+
+    void setColor(const QColor &color);
+    QColor color() const { return m_color; }
+
+    void setPenWidth(int width);
+    int penWidth() const { return m_penWidth; }
+
+    void setTextFontFamily(const QString &family);
+    QString textFontFamily() const { return m_textFontFamily; }
+    void setTextFontSize(int size);
+    int textFontSize() const { return m_textFontSize; }
+    void setTextBold(bool bold) { m_textBold = bold; }
+    bool textBold() const { return m_textBold; }
+    void setTextBackground(TextBackground background) { m_textBackground = background; }
+    TextBackground textBackground() const { return m_textBackground; }
+    // Style used for new text labels.
+    TextStyle currentTextStyle() const;
+
+    void setBlurIntensity(int intensity);
+    int blurIntensity() const { return m_blurIntensity; }
+
+    // Counter tool: first number, circle diameter and the drag distance that
+    // turns a click into counter + pointer. Placed counters keep their own.
+    void setCounterStartValue(int value);
+    int counterStartValue() const { return m_counterStartValue; }
+    void setCounterDiameter(int diameter);
+    int counterDiameter() const { return m_counterDiameter; }
+    void setCounterDragDistance(int distance) { m_counterDragDistance = qMax(1, distance); }
+    // Number the next counter will get.
+    int nextCounterValue() const;
+    // 0 when index is not a counter.
+    int counterValueOf(int index) const;
+
+    bool canUndo() const { return !m_undoStack.isEmpty(); }
+    bool canRedo() const { return !m_redoStack.isEmpty(); }
+
+    void setShiftHeld(bool held);
+
+    void beginDraw(const QPoint &pos);
+    void continueDraw(const QPoint &pos);
+    void endDraw(const QPoint &pos);
+
+    void render(QPainter *painter, const QPoint &offset);
+    bool hasAnnotations() const { return !m_annotations.isEmpty(); }
+
+    void clear();
+    void undo();
+    void redo();
+
+    void addTextAnnotation(const QPoint &pos, const QString &text);
+    // Editing an existing label; every change is one undo step.
+    QString textOf(int index) const;
+    TextStyle textStyleOf(int index) const;
+    QPoint textAnchorOf(int index) const;
+    // offset moves the label, e.g. when its editor was dragged elsewhere.
+    bool updateTextAnnotation(int index, const QString &text, const TextStyle &style,
+                              const QPoint &offset = QPoint());
+    // Recolours a finished annotation (not blur/pixelate); one undo step.
+    bool setAnnotationColor(int index, const QColor &color);
+    bool removeAnnotation(int index);
+    // Hides one annotation while it is being edited in place.
+    void setHiddenIndex(int index) { m_hiddenIndex = index; }
+    void addCounterAnnotation(const QPoint &pos);
+    bool eraseAnnotationAt(const QPoint &pos);
+
+    // Annotation move
+    int findAnnotationAt(const QPoint &pos);
+    void beginMove(int index);
+    void moveAnnotation(int index, const QPoint &delta);
+    void endMove();
+    bool isRotatable(int index) const;
+    bool isTextAnnotation(int index) const;
+    qreal rotationDegreesOf(int index) const;
+    void rotateAnnotation(int index, qreal degrees);
+    void beginRotate(int index);
+    void endRotate();
+    void beginTextResize(int index);
+    void resizeTextAnnotation(int index, const QRectF &bounds);
+    void endTextResize();
+    void setSelectedIndex(int index);
+    int selectedIndex() const { return m_selectedIndex; }
+    QRect boundingRectOf(int index) const;
+    QRectF rotatedBoundingRectOf(int index) const;
+
+    void setScreenSnapshot(const QPixmap &snapshot);
+    void releaseScreenSnapshot();
+    // Ratio of physical snapshot pixels to logical annotation coordinates, so
+    // the blur tool samples the correct snapshot region on high-DPI displays.
+    void setSnapshotScale(qreal scale) { m_snapshotScale = scale; }
+    QPixmap screenSnapshot() const { return m_screenSnapshot; }
+
+signals:
+    void annotationAdded();
+
+private:
+    struct Annotation {
+        Tool tool;
+        QColor color;
+        int penWidth;
+        QVector<QPoint> points;
+        QString text;
+        QString fontFamily;
+        int fontSize = 18;
+        QRect boundingRect;
+        int counterValue = 0;
+        // Circle size of a counter; points[1], when present, is its pointer target.
+        int counterDiameter = CounterGeometry::DefaultDiameter;
+        bool shiftConstrained = false;
+        qreal rotationDegrees = 0.0;
+        qreal textScaleX = 1.0;
+        qreal textScaleY = 1.0;
+        // Blur radius / pixelate block size captured when the region was
+        // drawn, so later slider changes only affect new regions.
+        int blurIntensity = 16;
+        bool textBold = true;
+        TextBackground textBackground = TextBox;
+    };
+
+    struct HistoryAction {
+        enum Type { Add, Remove, Rotate, Resize } type = Add;
+        Annotation annotation;
+        Annotation previousAnnotation;
+        int index = -1;
+        qreal previousRotationDegrees = 0.0;
+        qreal rotationDegrees = 0.0;
+    };
+
+    void drawAnnotation(QPainter *painter, const Annotation &ann, const QPoint &offset);
+    void replaceAnnotation(int index, const Annotation &updated);
+    void drawRedaction(QPainter *painter, Tool tool, const QRect &rect, const QPoint &offset,
+                       int intensity);
+    QPixmap redactedSnapshotRegion(Tool tool, const QRect &physicalRect, int intensity) const;
+    QRect textBaseBackgroundRect(const Annotation &ann) const;
+    QRect textBackgroundRect(const Annotation &ann) const;
+    QRect rawAnnotationBounds(const Annotation &ann, int padding = 10) const;
+    QRectF rotatedAnnotationBounds(const Annotation &ann, int padding = 10) const;
+    bool annotationContainsPoint(const Annotation &ann, const QPoint &pos, int padding = 8) const;
+    static bool isRotatableTool(Tool tool);
+    void pushHistory(HistoryAction::Type type, const Annotation &annotation, int index);
+    void appendHistoryAction(const HistoryAction &action);
+    void recalculateCounterValue();
+    static QRect counterCircleRect(const Annotation &ann);
+    void updateCounterPointer(const QPoint &pos);
+    void adjustSelectionForInsert(int index);
+    void adjustSelectionForRemove(int index);
+    void resetGestureState();
+
+    Tool m_currentTool;
+    QColor m_color;
+    int m_penWidth;
+    QString m_textFontFamily;
+    int m_textFontSize;
+    int m_blurIntensity;
+    bool m_shiftHeld;
+
+    QVector<Annotation> m_annotations;
+    QVector<HistoryAction> m_undoStack;
+    QVector<HistoryAction> m_redoStack;
+    Annotation m_currentAnnotation;
+    bool m_isDrawing;
+    int m_counterValue;
+    int m_counterStartValue = CounterGeometry::MinStartValue;
+    int m_counterDiameter = CounterGeometry::DefaultDiameter;
+    int m_counterDragDistance = 10;
+    int m_selectedIndex;
+    int m_textResizeIndex = -1;
+    Annotation m_textResizeOriginal;
+    int m_rotateIndex = -1;
+    qreal m_rotateOriginalDegrees = 0.0;
+    int m_moveGestureIndex = -1;
+    Annotation m_moveGestureOriginal;
+    bool m_moveGestureHistoryStarted = false;
+    qsizetype m_moveHistorySize = -1;
+    QPixmap m_screenSnapshot;
+    qreal m_snapshotScale = 1.0;
+    bool m_textBold = true;
+    TextBackground m_textBackground = TextBox;
+    int m_hiddenIndex = -1;
+    // Blurring is expensive and paintEvent runs on every mouse move; reuse
+    // results until the snapshot changes.
+    mutable QHash<QString, QPixmap> m_redactionCache;
+};
+
+#endif

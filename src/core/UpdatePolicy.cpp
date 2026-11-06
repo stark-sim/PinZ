@@ -1,0 +1,74 @@
+#include "UpdatePolicy.h"
+
+#include <QDir>
+#include <QFileInfo>
+#include <QJsonObject>
+#include <QSet>
+#include <QVersionNumber>
+
+namespace {
+QVersionNumber versionFromTag(QString tag)
+{
+    if (tag.startsWith(QLatin1Char('v'), Qt::CaseInsensitive))
+        tag.remove(0, 1);
+    return QVersionNumber::fromString(tag.trimmed());
+}
+}
+
+int countNewerStableReleases(const QJsonArray &releases, const QString &currentVersion)
+{
+    const QVersionNumber current = versionFromTag(currentVersion);
+    if (current.isNull())
+        return 0;
+
+    QSet<QString> versions;
+    for (const QJsonValue &value : releases) {
+        const QJsonObject release = value.toObject();
+        if (release.value(QStringLiteral("draft")).toBool()
+            || release.value(QStringLiteral("prerelease")).toBool()) {
+            continue;
+        }
+        const QVersionNumber candidate = versionFromTag(
+            release.value(QStringLiteral("tag_name")).toString());
+        if (!candidate.isNull() && QVersionNumber::compare(candidate, current) > 0)
+            versions.insert(candidate.toString());
+    }
+    return versions.size();
+}
+
+bool shouldSilentlyInstallUpdate(int newerStableReleaseCount, bool selfManagedInstall)
+{
+    return selfManagedInstall && newerStableReleaseCount >= 2;
+}
+
+bool shouldCheckForUpdates(bool manual, const QString &appDirectory,
+                           const QString &appImagePath)
+{
+    if (manual)
+        return true;
+    if (!appDirectory.isEmpty()
+        && QFileInfo(QDir(appDirectory).filePath(QStringLiteral(".portable"))).isFile()) {
+        return false;
+    }
+    return appImagePath.isEmpty()
+        || !QFileInfo(QDir(QFileInfo(appImagePath).absolutePath())
+                          .filePath(QStringLiteral(".portable"))).isFile();
+}
+
+LinuxUpdateChannel linuxUpdateChannel(const QString &appImagePath,
+                                      bool appImageIsFile, bool appImageIsWritable,
+                                      const QString &applicationFilePath)
+{
+    const QString aurDirectory = QStringLiteral("/opt/eshot/");
+    const QString path = QDir::cleanPath(appImagePath.trimmed());
+    if (path.startsWith(aurDirectory))
+        return LinuxUpdateChannel::Aur;
+    // The extracted AUR package runs /opt/eshot/usr/bin/EShot without APPIMAGE.
+    if (appImagePath.trimmed().isEmpty()
+        && QDir::cleanPath(applicationFilePath.trimmed()).startsWith(aurDirectory)) {
+        return LinuxUpdateChannel::Aur;
+    }
+    if (appImagePath.trimmed().isEmpty() || !appImageIsFile || !appImageIsWritable)
+        return LinuxUpdateChannel::PackageManager;
+    return LinuxUpdateChannel::SelfUpdate;
+}

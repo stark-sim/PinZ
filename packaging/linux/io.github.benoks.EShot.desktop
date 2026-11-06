@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Name=EShot
+Comment=Screenshot, annotation, OCR, upload, GIF and video capture tool
+Exec=eshot-launcher --control
+Icon=io.github.benoks.EShot-v4
+Terminal=false
+StartupNotify=false
+X-KDE-StartupNotify=false
+X-GNOME-UsesNotifications=true
+StartupWMClass=EShot
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
+Categories=Graphics;Photography;
+Keywords=screenshot;screen capture;annotation;ocr;
+Actions=Capture;Settings;Quit;
+
+[Desktop Action Capture]
+Name=Capture Screenshot
+Exec=eshot-launcher --capture
+
+[Desktop Action Settings]
+Name=Settings
+Exec=eshot-launcher --settings
+
+[Desktop Action Quit]
+Name=Quit EShot
+Exec=eshot-launcher --quit

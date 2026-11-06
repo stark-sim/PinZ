@@ -1,0 +1,5610 @@
+#include "CaptureOverlay.h"
+#include "../core/ProtectedFolderHint.h"
+#include "CaptureInteractionPolicy.h"
+#include "CaptureScreenViews.h"
+#include "WindowSnapPolicy.h"
+#include "WindowsWindowProvider.h"
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+#include "KWinWindowListClient.h"
+#include "core/WindowCaptureSupport.h"
+#endif
+#include "WindowsScreenGrab.h"
+#include "PinnedWindow.h"
+#include "annotation/AnnotationEngine.h"
+#include "annotation/AnnotationRotationGeometry.h"
+#include "ui/AnnotationToolbar.h"
+#include "ui/OverlayPanelStyle.h"
+#include "ui/OcrDialog.h"
+#include "core/ComponentPaths.h"
+#include "ShortcutSheet.h"
+#include "ui/HintBubble.h"
+#include "ui/OnboardingTips.h"
+#include "ui/UploadDialog.h"
+#include "core/ImageUploader.h"
+#include "core/DebouncedSettingsWriter.h"
+#include "core/HotkeyManager.h"
+#include "core/LinuxDesktopIntegration.h"
+#include "core/LinuxKWinActivation.h"
+#include "core/LinuxActiveWindowTitle.h"
+#include "core/LinuxPortalScreenshot.h"
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+#include "core/LinuxFastCapture.h"
+#endif
+#include "core/LinuxScreenshotPolicy.h"
+#include "core/VisualSearch.h"
+#include "recording/AudioDevices.h"
+#include "recording/LinuxRecordingSupport.h"
+#include "recording/RecordingSettingsPolicy.h"
+#include "recording/RecordingDrawerPolicy.h"
+
+#include "../core/TranslationManager.h"
+
+#include <QPainter>
+#include <QPainterPath>
+#include <QLinearGradient>
+#include <QScreen>
+#include <QApplication>
+#include <QGuiApplication>
+#include <QCursor>
+#include <QWindow>
+#include <QClipboard>
+#include <QMouseEvent>
+#include <QKeyEvent>
+#include <QDateTime>
+#include <QSettings>
+#include <QStandardPaths>
+#include <functional>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QFormLayout>
+#include <QPushButton>
+#include <QLabel>
+#include <QFrame>
+#include <QToolButton>
+#include <QFontComboBox>
+#include <QLineEdit>
+#include <QSpinBox>
+#include <QAbstractSpinBox>
+#include <QSlider>
+#include <QComboBox>
+#include <QCheckBox>
+#include <QButtonGroup>
+#include <QSignalBlocker>
+#include <QPropertyAnimation>
+#include <QVariantAnimation>
+#include <QAbstractAnimation>
+#include <QEasingCurve>
+#include <QDebug>
+#include <QDir>
+#include <QPointer>
+#include <QRegularExpression>
+#include <QCoreApplication>
+#include <QMessageBox>
+#include <QFileInfo>
+#include <QFile>
+#include <QTemporaryFile>
+#include <QProcess>
+#include <QDesktopServices>
+#include <QUrl>
+#include <QUrlQuery>
+#include <QHash>
+
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
+
+namespace {
+void addOverlayPanelSection(QVBoxLayout *layout, QWidget *parent,
+                            const QString &title, bool separator = true)
+{
+    if (separator) {
+        auto *line = new QFrame(parent);
+        line->setFrameShape(QFrame::HLine);
+        line->setProperty("panelRole", QStringLiteral("separator"));
+        layout->addWidget(line);
+    }
+
+    auto *label = new QLabel(title, parent);
+    label->setProperty("panelRole", QStringLiteral("section"));
+    layout->addWidget(label);
+}
+
+QString recordingSecondsText(int seconds)
+{
+    if (seconds >= 60 && seconds % 60 == 0)
+        return TranslationManager::tr("recMinutes").arg(seconds / 60);
+    return TranslationManager::tr("recSeconds").arg(seconds);
+}
+
+// Form labels from Settings ("Start delay:") without their colon.
+QString withoutTrailingColon(QString label)
+{
+    label = label.trimmed();
+    while (label.endsWith(QLatin1Char(':')) || label.endsWith(QChar(0xFF1A)))
+        label.chop(1);
+    return label.trimmed();
+}
+
+QString recordingQualityPresetText(RecordingQualityPreset preset)
+{
+    switch (preset) {
+    case RecordingQualityPreset::Small:
+        return TranslationManager::tr("recQualitySmall");
+    case RecordingQualityPreset::Balanced:
+        return TranslationManager::tr("recQualityBalanced");
+    case RecordingQualityPreset::High:
+        return TranslationManager::tr("recQualityHigh");
+    case RecordingQualityPreset::Custom:
+        break;
+    }
+    return TranslationManager::tr("recQualityCustom");
+}
+
+QString recordingQualityPresetDetails(RecordingQualityPreset preset, bool gif)
+{
+    if (gif) {
+        const GifQualityValues values = gifQualityValues(preset);
+        return QStringLiteral("%1 px · %2 FPS").arg(values.maxSide).arg(values.fps);
+    }
+    const VideoQualityValues values = videoQualityValues(preset);
+    return QStringLiteral("CRF %1 · %2 FPS").arg(values.crf).arg(values.fps);
+}
+
+QLineEdit *overlaySpinBoxEditor(QObject *object)
+{
+    for (QWidget *widget = qobject_cast<QWidget *>(object); widget;
+         widget = widget->parentWidget()) {
+        if (auto *spinBox = qobject_cast<QAbstractSpinBox *>(widget))
+            return spinBox->findChild<QLineEdit *>();
+    }
+    return nullptr;
+}
+
+void drawCaptureHintShortcut(QPainter &painter, int &x, int y,
+                             const QString &key, const QString &label,
+                             bool compact)
+{
+    QFont keyFont = painter.font();
+    keyFont.setPointSize(9);
+    keyFont.setWeight(QFont::DemiBold);
+    QFontMetrics keyMetrics(keyFont);
+    const int keyWidth = keyMetrics.horizontalAdvance(key) + 14;
+    const QRect keyRect(x, y, keyWidth, 24);
+
+    painter.setPen(QPen(QColor(255, 255, 255, 55), 1));
+    painter.setBrush(QColor(255, 255, 255, 24));
+    painter.drawRoundedRect(keyRect, 5, 5);
+    painter.setFont(keyFont);
+    painter.setPen(QColor(246, 248, 251, 235));
+    painter.drawText(keyRect, Qt::AlignCenter, key);
+    x = keyRect.right() + 1;
+
+    if (!compact) {
+        QFont labelFont = painter.font();
+        labelFont.setPointSize(9);
+        labelFont.setWeight(QFont::Normal);
+        painter.setFont(labelFont);
+        painter.setPen(QColor(220, 224, 230, 220));
+        const int labelWidth = QFontMetrics(labelFont).horizontalAdvance(label);
+        painter.drawText(QRect(x + 7, y, labelWidth, 24), Qt::AlignVCenter, label);
+        x += labelWidth + 7;
+    }
+}
+
+// Shown when EShot could not become the active window and no input arrived,
+// typically because a fullscreen game still holds the mouse and keyboard.
+void drawInputBlockedBanner(QPainter &painter, const QRect &monitorRect, const QString &text)
+{
+    if (!monitorRect.isValid() || text.isEmpty())
+        return;
+    QFont font = painter.font();
+    font.setPointSize(11);
+    font.setWeight(QFont::DemiBold);
+    const QFontMetrics metrics(font);
+    const int maxTextWidth = qMax(200, qMin(760, monitorRect.width() - 80));
+    const QRect textBounds = metrics.boundingRect(QRect(0, 0, maxTextWidth, 1000),
+                                                  Qt::AlignCenter | Qt::TextWordWrap, text);
+    QRect banner(0, 0, textBounds.width() + 40, textBounds.height() + 24);
+    banner.moveCenter(QPoint(monitorRect.center().x(), 0));
+    banner.moveTop(monitorRect.top() + 32);
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(255, 196, 0, 200), 1.5));
+    painter.setBrush(QColor(28, 24, 12, 235));
+    painter.drawRoundedRect(banner, 10, 10);
+    painter.setFont(font);
+    painter.setPen(QColor(255, 244, 214));
+    painter.drawText(banner.adjusted(20, 12, -20, -12), Qt::AlignCenter | Qt::TextWordWrap, text);
+    painter.restore();
+}
+
+void drawCaptureHints(QPainter &painter, const QRect &monitorRect, bool recordingMode)
+{
+    QFont primaryFont = painter.font();
+    primaryFont.setPointSize(11);
+    primaryFont.setWeight(QFont::DemiBold);
+    const QString primaryText = QStringLiteral("%1  •  %2").arg(
+        recordingMode ? TranslationManager::captureHintRecording()
+                      : TranslationManager::captureHintDrag(),
+        TranslationManager::captureHintScreen());
+    const int primaryWidth = QFontMetrics(primaryFont).horizontalAdvance(primaryText) + 36;
+    QFont secondaryFont = primaryFont;
+    secondaryFont.setPointSize(9);
+    secondaryFont.setWeight(QFont::Normal);
+    const QString quickSettingsText = recordingMode
+        ? QString()
+        : TranslationManager::captureHintQuickSettings();
+    const QString stopShortcut = HotkeyManager::instance().recordingStopShortcutText();
+    const QString stopLabel = TranslationManager::recordingStop();
+    const int secondaryWidth = quickSettingsText.isEmpty()
+        ? 0 : QFontMetrics(secondaryFont).horizontalAdvance(quickSettingsText) + 36;
+    const int stopHintWidth = recordingMode ? 0
+        : QFontMetrics(secondaryFont).horizontalAdvance(stopShortcut + stopLabel) + 64;
+    const int preferredWidth = recordingMode
+        ? qBound(620, qMax(primaryWidth, secondaryWidth), 840)
+        : qBound(440, qMax(qMax(primaryWidth, secondaryWidth), stopHintWidth), 840);
+    const QRect hintRect = captureHintRect(
+        monitorRect, QSize(preferredWidth, recordingMode ? 76 : 132));
+    if (!hintRect.isValid())
+        return;
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(255, 255, 255, 42), 1));
+    painter.setBrush(QColor(20, 20, 22, 178));
+    painter.drawRoundedRect(hintRect, 10, 10);
+
+    painter.setFont(primaryFont);
+    painter.setPen(QColor(246, 248, 251, 238));
+    const QRect primaryRect(hintRect.left() + 16, hintRect.top() + 8,
+                            hintRect.width() - 32, 22);
+    const QString visiblePrimary = QFontMetrics(primaryFont).elidedText(
+        primaryText, Qt::ElideRight, primaryRect.width());
+    painter.drawText(primaryRect, Qt::AlignCenter, visiblePrimary);
+
+    const bool compact = hintRect.width() < 390;
+    struct HintShortcut { QString key; QString label; };
+    const QList<HintShortcut> shortcuts = recordingMode
+        ? QList<HintShortcut>{
+              {HotkeyManager::instance().recordingPauseShortcutText(),
+               TranslationManager::recordingPauseResume()},
+              {HotkeyManager::instance().recordingStopShortcutText(),
+               TranslationManager::recordingStopShort()},
+              {HotkeyManager::instance().recordingCancelShortcutText(),
+               TranslationManager::recordingCancel()}}
+        : [] {
+              // Follow the user's overlay shortcuts; a cleared one is not shown.
+              QList<HintShortcut> items;
+              const QString copyKey = OnboardingTips::overlayShortcutText(
+                  QStringLiteral("actionCopy"), QStringLiteral("Ctrl+C"));
+              const QString saveKey = OnboardingTips::overlayShortcutText(
+                  QStringLiteral("actionSave"), QStringLiteral("Ctrl+S"));
+              if (!copyKey.isEmpty())
+                  items.append({copyKey, TranslationManager::captureHintCopy()});
+              if (!saveKey.isEmpty())
+                  items.append({saveKey, TranslationManager::captureHintSave()});
+              items.append({QStringLiteral("Esc"), TranslationManager::captureHintCancel()});
+              items.append({QStringLiteral("?"), TranslationManager::tr("captureHintShortcuts")});
+              return items;
+          }();
+
+    QFont keyFont = painter.font();
+    keyFont.setPointSize(9);
+    keyFont.setWeight(QFont::DemiBold);
+    QFont labelFont = keyFont;
+    labelFont.setWeight(QFont::Normal);
+    int shortcutsWidth = 0;
+    for (int i = 0; i < shortcuts.size(); ++i) {
+        shortcutsWidth += QFontMetrics(keyFont).horizontalAdvance(shortcuts[i].key) + 14;
+        if (!compact)
+            shortcutsWidth += QFontMetrics(labelFont).horizontalAdvance(shortcuts[i].label) + 7;
+        if (i + 1 < shortcuts.size())
+            shortcutsWidth += compact ? 8 : 16;
+    }
+
+    int x = hintRect.left() + qMax(10, (hintRect.width() - shortcutsWidth) / 2);
+    const int y = hintRect.top() + (recordingMode ? 42 : 35);
+    for (int i = 0; i < shortcuts.size(); ++i) {
+        drawCaptureHintShortcut(painter, x, y, shortcuts[i].key, shortcuts[i].label, compact);
+        if (i + 1 < shortcuts.size())
+            x += compact ? 8 : 16;
+    }
+    if (!quickSettingsText.isEmpty()) {
+        painter.setFont(secondaryFont);
+        painter.setPen(QColor(190, 196, 205, 205));
+        const QRect secondaryRect(hintRect.left() + 16, hintRect.top() + 64,
+                                  hintRect.width() - 32, 20);
+        const QString visibleSecondary = QFontMetrics(secondaryFont).elidedText(
+            quickSettingsText, Qt::ElideRight, secondaryRect.width());
+        painter.drawText(secondaryRect, Qt::AlignCenter, visibleSecondary);
+
+        QFont stopKeyFont = secondaryFont;
+        stopKeyFont.setWeight(QFont::DemiBold);
+        QFont stopLabelFont = secondaryFont;
+        const int stopRowWidth = QFontMetrics(stopKeyFont).horizontalAdvance(stopShortcut) + 14
+            + 7 + QFontMetrics(stopLabelFont).horizontalAdvance(stopLabel);
+        int stopX = hintRect.left() + qMax(10, (hintRect.width() - stopRowWidth) / 2);
+        drawCaptureHintShortcut(painter, stopX, hintRect.top() + 94,
+                                stopShortcut, stopLabel, compact);
+    }
+    painter.restore();
+}
+
+#ifdef Q_OS_WIN
+BOOL CALLBACK collectPhysicalMonitorGeometries(HMONITOR monitor, HDC, LPRECT, LPARAM data)
+{
+    auto *geometries = reinterpret_cast<QHash<QString, QRect> *>(data);
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info)) {
+        const RECT &rect = info.rcMonitor;
+        geometries->insert(QString::fromWCharArray(info.szDevice),
+                           QRect(rect.left, rect.top,
+                                 rect.right - rect.left,
+                                 rect.bottom - rect.top));
+    }
+    return TRUE;
+}
+#endif
+
+class SideTabButton : public QPushButton
+{
+public:
+    explicit SideTabButton(const QString &text, QWidget *parent = nullptr)
+        : QPushButton(text, parent)
+    {
+        setFixedWidth(28);
+        fitToAvailableHeight(10000);
+    }
+
+    void fitToAvailableHeight(int availableHeight)
+    {
+        setFixedHeight(quickSettingsTabHeight(
+            QFontMetrics(labelFont()).horizontalAdvance(text()) + IconSpace, availableHeight));
+    }
+
+    // 0..1 accent glow used to draw attention to the tab for new users.
+    void setGlow(qreal glow)
+    {
+        m_glow = glow;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+
+        QLinearGradient gradient(rect().topLeft(), rect().bottomRight());
+        if (underMouse()) {
+            gradient.setColorAt(0.0, QColor(82, 82, 82, 245));
+            gradient.setColorAt(1.0, QColor(54, 54, 54, 245));
+        } else {
+            gradient.setColorAt(0.0, QColor(62, 62, 62, 235));
+            gradient.setColorAt(1.0, QColor(43, 43, 43, 235));
+        }
+        QRectF r = rect().adjusted(0, 0, -1, -1);
+        constexpr qreal radius = 6.0;
+        QPainterPath tabPath;
+        tabPath.moveTo(r.left(), r.top());
+        tabPath.lineTo(r.right() - radius, r.top());
+        tabPath.quadTo(r.right(), r.top(), r.right(), r.top() + radius);
+        tabPath.lineTo(r.right(), r.bottom() - radius);
+        tabPath.quadTo(r.right(), r.bottom(), r.right() - radius, r.bottom());
+        tabPath.lineTo(r.left(), r.bottom());
+        tabPath.closeSubpath();
+
+        painter.setPen(QPen(QColor(255, 255, 255, 55), 1));
+        painter.setBrush(gradient);
+        painter.drawPath(tabPath);
+
+        painter.setPen(QPen(QColor(0, 0, 0, 90), 1));
+        painter.drawLine(rect().topLeft(), rect().bottomLeft());
+
+        if (m_glow > 0.0) {
+            painter.setPen(QPen(QColor(255, 255, 255, int(200 * m_glow)), 2));
+            painter.setBrush(QColor(255, 255, 255, int(45 * m_glow)));
+            painter.drawPath(tabPath);
+        }
+
+        // Gear above the rotated label so the tab reads as "settings".
+        const int iconSize = 14;
+        QIcon(QStringLiteral(":/icons/gear.svg"))
+            .paint(&painter, QRect((width() - iconSize) / 2, 8, iconSize, iconSize));
+
+        painter.setFont(labelFont());
+        painter.setPen(QColor(245, 245, 245));
+        painter.translate(width() / 2.0, (height() + IconSpace) / 2.0);
+        painter.rotate(-90);
+        const int textLength = height() - IconSpace;
+        painter.drawText(QRect(-textLength / 2, -width() / 2, textLength, width()),
+                         Qt::AlignCenter,
+                         text());
+    }
+
+private:
+    static constexpr int IconSpace = 20;
+    qreal m_glow = 0.0;
+
+    QFont labelFont() const
+    {
+        QFont result = font();
+        result.setPointSize(8);
+        result.setBold(true);
+        result.setLetterSpacing(QFont::AbsoluteSpacing, 1.1);
+        return result;
+    }
+};
+
+
+}
+
+CaptureOverlay::CaptureOverlay(QWidget *parent)
+    : QWidget(parent, Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint | Qt::Tool)
+    , m_isSelecting(false)
+    , m_selectionComplete(false)
+    , m_ignoreNextMouseRelease(false)
+    , m_toolbar(nullptr)
+    , m_actionPanel(nullptr)
+    , m_annotationEngine(nullptr)
+    , m_captureDelayTimer(nullptr)
+    , m_overlayOpacity(100)
+    , m_crosshairStyle("dash")
+    , m_copyAfterCapture(false)
+    , m_closeAfterCopy(false)
+    , m_instantCopyAfterSelection(false)
+    , m_showCaptureHints(true)
+    , m_resizeMode(ResNone)
+    , m_foregroundHwnd(nullptr)
+    , m_isDraggingAnnotation(false)
+    , m_textJustCommitted(false)
+    , m_eyedropperActive(false)
+    , m_selectionLocked(false)
+{
+    m_settingsWriter = new DebouncedSettingsWriter(
+        QStringLiteral("EShot"), QStringLiteral("EShot"), 200, this);
+    if (qEnvironmentVariableIntValue("ESHOT_WAYLAND_XWAYLAND_OVERLAY") == 1)
+        setWindowFlag(Qt::X11BypassWindowManagerHint, true);
+    setAttribute(Qt::WA_TranslucentBackground, false);
+    setAttribute(Qt::WA_DeleteOnClose, false);
+    setAttribute(Qt::WA_AlwaysShowToolTips, true);
+    setFocusPolicy(Qt::StrongFocus);
+    setMouseTracking(true);
+    setCursor(Qt::CrossCursor);
+    // The DirectShow device list is only fetched when the recording drawer
+    // shows the microphone list (ensureAudioDevicesLoaded()) or a recording
+    // needs a dshow input, not for every pre-built overlay.
+
+#ifdef Q_OS_LINUX
+    if (qEnvironmentVariableIntValue("ESHOT_WAYLAND_XWAYLAND_OVERLAY") == 1) {
+        // The capture canvas stays unmanaged so it can span the XWayland
+        // virtual desktop. A tiny managed editor receives real KWin keyboard
+        // focus and mirrors its input into the visible editor over the canvas.
+        m_textFocusProxy = new QTextEdit(nullptr);
+        m_textFocusProxy->setWindowFlags(
+            Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint | Qt::Tool);
+        m_textFocusProxy->setAttribute(Qt::WA_DeleteOnClose, false);
+        m_textFocusProxy->setWindowOpacity(0.01);
+        m_textFocusProxy->setFixedSize(24, 24);
+        m_textFocusProxy->setAcceptRichText(false);
+        m_textFocusProxy->setFocusPolicy(Qt::StrongFocus);
+        m_textFocusProxy->setWindowTitle(QStringLiteral("EShot Text Input"));
+        m_textFocusProxy->hide();
+        m_textFocusProxy->installEventFilter(this);
+    }
+#endif
+
+    // Text editor (multi-line support)
+    m_textEdit = new QTextEdit(this);
+    m_textEdit->setAcceptRichText(false);
+    m_textEdit->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_textEdit->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_textEdit->setStyleSheet(R"(
+        QTextEdit {
+            background-color: rgba(0, 0, 0, 180);
+            color: white;
+            border: 2px solid #0078D4;
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 14px;
+            font-family: 'Segoe UI', Arial;
+        }
+    )");
+    m_textEdit->hide();
+    m_textEdit->installEventFilter(this);
+    if (m_textFocusProxy) {
+        connect(m_textFocusProxy, &QTextEdit::textChanged, this, [this]() {
+            if (!m_textEdit || !m_textFocusProxy || !m_textFocusProxy->isVisible())
+                return;
+            m_textEdit->setPlainText(m_textFocusProxy->toPlainText());
+            QTextCursor cursor = m_textEdit->textCursor();
+            cursor.movePosition(QTextCursor::End);
+            m_textEdit->setTextCursor(cursor);
+        });
+    }
+    connect(m_textEdit, &QTextEdit::textChanged, this, [this]() {
+        // Auto height adjust
+        if (m_textEdit && m_textEdit->isVisible()) {
+            QTextDocument *doc = m_textEdit->document();
+            QSizeF size = doc->size();
+            int h = qMax(30, static_cast<int>(size.height()) + 10);
+            m_textEdit->setFixedHeight(h);
+            updateTextEditPanelPosition();
+        }
+    });
+
+    m_textEditPanel = new QWidget(this);
+    m_textEditPanel->setObjectName(QStringLiteral("textEditPanel"));
+    m_textEditPanel->setStyleSheet(R"(
+        QWidget#textEditPanel {
+            background-color: rgba(31, 32, 35, 245);
+            border: 1px solid #56585d;
+            border-radius: 8px;
+        }
+        QToolButton {
+            background-color: #34363a;
+            color: white;
+            border: 1px solid #505258;
+            border-radius: 6px;
+        }
+        QToolButton:hover { background-color: #45484e; border-color: #6f7279; }
+        QToolButton:pressed { background-color: #25272a; }
+        QToolButton#textCommitButton {
+            background-color: #0878c9;
+            border-color: #1593e6;
+        }
+        QToolButton#textCommitButton:hover { background-color: #0b8de8; }
+        QToolButton:checked { background-color: #5a5d63; border-color: #8a8d93; }
+        QFontComboBox, QSpinBox {
+            background: #292b2f;
+            color: white;
+            border: 1px solid #55585f;
+            border-radius: 6px;
+            min-height: 0px;
+        }
+        QFontComboBox { padding: 0px 8px; }
+        QFontComboBox:hover, QSpinBox:hover {
+            border-color: #6a6a6a;
+            background: #303030;
+        }
+        QFontComboBox:focus, QSpinBox:focus {
+            border-color: #0078D4;
+        }
+        QFontComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 28px;
+            border-left: 1px solid #4b4d52;
+            border-top-right-radius: 6px;
+            border-bottom-right-radius: 6px;
+            background: #34363a;
+        }
+        QFontComboBox::down-arrow {
+            image: url(:/icons/chevron_down.svg);
+            width: 14px;
+            height: 14px;
+        }
+        QSpinBox {
+            padding: 0px;
+        }
+        QSpinBox::up-button, QSpinBox::down-button {
+            subcontrol-origin: border;
+            width: 22px;
+            background: #34363a;
+            border-left: 1px solid #4b4d52;
+        }
+        QSpinBox::up-button {
+            subcontrol-position: top right;
+            border-top-right-radius: 6px;
+        }
+        QSpinBox::down-button {
+            subcontrol-position: bottom right;
+            border-bottom-right-radius: 6px;
+        }
+        QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+            background: #3a3a3a;
+        }
+        QSpinBox::up-arrow {
+            image: url(:/icons/chevron_up.svg);
+            width: 11px;
+            height: 11px;
+        }
+        QSpinBox::down-arrow {
+            image: url(:/icons/chevron_down.svg);
+            width: 11px;
+            height: 11px;
+        }
+    )");
+    QHBoxLayout *textPanelLayout = new QHBoxLayout(m_textEditPanel);
+    textPanelLayout->setContentsMargins(6, 6, 6, 6);
+    textPanelLayout->setSpacing(6);
+    m_textMoveHandle = new QToolButton(m_textEditPanel);
+    m_textMoveHandle->setIcon(QIcon(QStringLiteral(":/icons/drag.svg")));
+    m_textMoveHandle->setIconSize(QSize(17, 17));
+    m_textMoveHandle->setFixedSize(30, 30);
+    m_textMoveHandle->setToolTip(TranslationManager::toolMove());
+    m_textMoveHandle->setCursor(Qt::SizeAllCursor);
+    m_textMoveHandle->setFocusPolicy(Qt::NoFocus);
+    m_textMoveHandle->installEventFilter(this);
+    m_textEditPanel->installEventFilter(this);
+    m_textInlineFontCombo = new QFontComboBox(m_textEditPanel);
+    m_textInlineFontCombo->setFixedSize(158, 32);
+    m_textInlineSizeSpin = new QSpinBox(m_textEditPanel);
+    m_textInlineSizeSpin->setRange(8, 72);
+    m_textInlineSizeSpin->setAlignment(Qt::AlignCenter);
+    m_textInlineSizeSpin->setFixedSize(68, 32);
+    m_textBoldButton = new QToolButton(m_textEditPanel);
+    m_textBoldButton->setText(QStringLiteral("B"));
+    QFont boldButtonFont = m_textBoldButton->font();
+    boldButtonFont.setBold(true);
+    boldButtonFont.setPointSize(11);
+    m_textBoldButton->setFont(boldButtonFont);
+    m_textBoldButton->setCheckable(true);
+    m_textBoldButton->setFixedSize(30, 30);
+    m_textBoldButton->setToolTip(TranslationManager::tr("textBold") + QStringLiteral(" (Ctrl+B)"));
+    m_textBoldButton->setFocusPolicy(Qt::NoFocus);
+    m_textBackgroundButton = new QToolButton(m_textEditPanel);
+    m_textBackgroundButton->setIconSize(QSize(20, 20));
+    m_textBackgroundButton->setFixedSize(30, 30);
+    m_textBackgroundButton->setFocusPolicy(Qt::NoFocus);
+    m_textCommitButton = new QToolButton(m_textEditPanel);
+    m_textCommitButton->setObjectName(QStringLiteral("textCommitButton"));
+    m_textCommitButton->setIcon(QIcon(QStringLiteral(":/icons/check.svg")));
+    m_textCommitButton->setIconSize(QSize(18, 18));
+    m_textCommitButton->setFixedSize(30, 30);
+    m_textCommitButton->setToolTip(TranslationManager::save() + QStringLiteral(" (Enter)"));
+    m_textCommitButton->setFocusPolicy(Qt::NoFocus);
+    m_textCancelButton = new QToolButton(m_textEditPanel);
+    m_textCancelButton->setIcon(QIcon(QStringLiteral(":/icons/close.svg")));
+    m_textCancelButton->setIconSize(QSize(16, 16));
+    m_textCancelButton->setFixedSize(30, 30);
+    m_textCancelButton->setToolTip(TranslationManager::cancel() + QStringLiteral(" (Esc)"));
+    m_textCancelButton->setFocusPolicy(Qt::NoFocus);
+    textPanelLayout->addWidget(m_textMoveHandle);
+    textPanelLayout->addWidget(m_textInlineFontCombo);
+    textPanelLayout->addWidget(m_textInlineSizeSpin);
+    textPanelLayout->addWidget(m_textBoldButton);
+    textPanelLayout->addWidget(m_textBackgroundButton);
+    textPanelLayout->addWidget(m_textCommitButton);
+    textPanelLayout->addWidget(m_textCancelButton);
+    m_textEditPanel->hide();
+    connect(m_textCommitButton, &QToolButton::clicked, this, &CaptureOverlay::commitText);
+    connect(m_textCancelButton, &QToolButton::clicked, this, &CaptureOverlay::cancelTextEdit);
+    connect(m_textBoldButton, &QToolButton::toggled, this, [this](bool bold) {
+        if (m_annotationEngine) m_annotationEngine->setTextBold(bold);
+        updateTextEditorStyle();
+    });
+    connect(m_textBackgroundButton, &QToolButton::clicked, this, [this]() {
+        if (!m_annotationEngine) return;
+        const int next = (int(m_annotationEngine->textBackground()) + 1) % 3;
+        m_annotationEngine->setTextBackground(static_cast<AnnotationEngine::TextBackground>(next));
+        refreshTextStyleButtons();
+    });
+    connect(m_textInlineFontCombo, &QFontComboBox::currentFontChanged, this, [this](const QFont &font) {
+        if (m_annotationEngine) m_annotationEngine->setTextFontFamily(font.family());
+        updateTextEditorStyle();
+    });
+    connect(m_textInlineSizeSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int size) {
+        if (m_annotationEngine) m_annotationEngine->setTextFontSize(size);
+        updateTextEditorStyle();
+        if (m_textEdit && m_textEdit->isVisible()) {
+            QTextDocument *doc = m_textEdit->document();
+            int h = qMax(30, static_cast<int>(doc->size().height()) + 10);
+            m_textEdit->setFixedHeight(h);
+            updateTextEditPanelPosition();
+        }
+    });
+
+    m_annotationEngine = new AnnotationEngine(this);
+
+    m_toolbar = new AnnotationToolbar(this);
+    m_toolbar->hide();
+
+    connect(m_toolbar, &AnnotationToolbar::toolSelected, this, &CaptureOverlay::onToolSelected);
+    // Undo/redo shift annotation indices, so close an open label editor first.
+    connect(m_toolbar, &AnnotationToolbar::undoRequested, [this]() {
+        cancelTextEdit();
+        if (m_annotationEngine) { m_annotationEngine->undo(); update(); updateUndoRedoState(); }
+    });
+    connect(m_toolbar, &AnnotationToolbar::redoRequested, [this]() {
+        cancelTextEdit();
+        if (m_annotationEngine) { m_annotationEngine->redo(); update(); updateUndoRedoState(); }
+    });
+    connect(m_toolbar, &AnnotationToolbar::colorChanged, [this](const QColor &c) {
+        if (!m_annotationEngine) return;
+        m_annotationEngine->setColor(c);
+        if (m_textEdit && m_textEdit->isVisible()) {
+            updateTextEditorStyle();
+        } else if (m_annotationEngine->setAnnotationColor(m_annotationEngine->selectedIndex(), c)) {
+            // Picking a colour with an annotation selected recolours it.
+            update();
+            updateUndoRedoState();
+        }
+    });
+    connect(m_toolbar, &AnnotationToolbar::modalDialogClosed,
+            this, &CaptureOverlay::restoreAfterModalDialog);
+    connect(m_toolbar, &AnnotationToolbar::penWidthChanged, [this](int w) {
+        if (m_annotationEngine) m_annotationEngine->setPenWidth(w);
+        if (m_quickPenWidthSlider) {
+            QSignalBlocker blocker(m_quickPenWidthSlider);
+            m_quickPenWidthSlider->setValue(w);
+        }
+    });
+    connect(m_toolbar, &AnnotationToolbar::textFontFamilyChanged, [this](const QString &family) {
+        if (m_annotationEngine) m_annotationEngine->setTextFontFamily(family);
+        if (m_textEdit && m_textEdit->isVisible()) {
+            if (m_textInlineFontCombo) {
+                QSignalBlocker blocker(m_textInlineFontCombo);
+                m_textInlineFontCombo->setCurrentFont(QFont(family));
+            }
+            updateTextEditorStyle();
+            updateTextEditPanelPosition();
+        }
+    });
+    connect(m_toolbar, &AnnotationToolbar::textFontSizeChanged, [this](int size) {
+        if (m_annotationEngine) m_annotationEngine->setTextFontSize(size);
+        if (m_textEdit && m_textEdit->isVisible()) {
+            if (m_textInlineSizeSpin) {
+                QSignalBlocker blocker(m_textInlineSizeSpin);
+                m_textInlineSizeSpin->setValue(size);
+            }
+            updateTextEditorStyle();
+            updateTextEditPanelPosition();
+        }
+    });
+    connect(m_toolbar, &AnnotationToolbar::eyedropperRequested, this, &CaptureOverlay::onEyedropperRequested);
+    connect(m_toolbar, &AnnotationToolbar::lockToggled, this, &CaptureOverlay::onSelectionLockToggled);
+    connect(m_toolbar, &AnnotationToolbar::ocrRequested, this, &CaptureOverlay::onOcrRequested);
+    connect(m_toolbar, &AnnotationToolbar::uploadRequested, this, &CaptureOverlay::onUploadRequested);
+    connect(m_toolbar, &AnnotationToolbar::googleLensRequested, this, &CaptureOverlay::onGoogleLensRequested);
+    connect(m_toolbar, &AnnotationToolbar::recordRequested, this, &CaptureOverlay::onRecordRequested);
+    connect(m_annotationEngine, &AnnotationEngine::annotationAdded, this, &CaptureOverlay::updateUndoRedoState);
+
+    setupToolSettingsDrawer();
+    setupRecordingDrawer();
+
+    m_actionPanel = new QWidget(this);
+    m_actionPanel->setStyleSheet(R"(
+        QWidget { background-color: #2d2d2d; border: 1px solid #404040; border-radius: 10px; }
+    )");
+    QVBoxLayout *actionLayout = new QVBoxLayout(m_actionPanel);
+    actionLayout->setContentsMargins(6, 8, 6, 8);
+    actionLayout->setSpacing(5);
+    {
+        auto addBtn = [&](const QString &icon, const QString &tip, std::function<void()> handler) {
+            QPushButton *btn = new QPushButton(this);
+            btn->setToolTip(tip);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setFixedSize(36, 36);
+            btn->setIcon(QIcon(icon));
+            btn->setIconSize(QSize(20, 20));
+            connect(btn, &QPushButton::clicked, this, [handler](bool) { handler(); });
+            actionLayout->addWidget(btn);
+            return btn;
+        };
+        QPushButton *pinBtn = addBtn(":/icons/pin.svg", TranslationManager::actionPin(),
+            [this]() { onPinToDesktop(); });
+        pinBtn->setStyleSheet(R"(
+            QPushButton { background-color: #3a3a3a; border: 1px solid #505050; border-radius: 8px; }
+            QPushButton:hover { background-color: #454545; border-color: #606060; }
+            QPushButton:pressed { background-color: #333333; }
+        )");
+        QPushButton *copyBtn = addBtn(":/icons/copy.svg", TranslationManager::actionCopy(),
+            [this]() { onCopyToClipboard(); });
+        copyBtn->setStyleSheet(R"(
+            QPushButton { background-color: #3a3a3a; border: 1px solid #505050; border-radius: 8px; }
+            QPushButton:hover { background-color: #454545; border-color: #606060; }
+            QPushButton:pressed { background-color: #333333; }
+        )");
+        QPushButton *saveBtn = addBtn(":/icons/save.svg", TranslationManager::actionSave(),
+            [this]() { onSave(); });
+        saveBtn->setStyleSheet(R"(
+            QPushButton { background-color: #3a3a3a; border: 1px solid #505050; border-radius: 8px; }
+            QPushButton:hover { background-color: #454545; border-color: #606060; }
+            QPushButton:pressed { background-color: #333333; }
+        )");
+        QPushButton *closeBtn = addBtn(":/icons/close.svg", TranslationManager::actionClose(),
+            [this]() { onClose(); });
+        closeBtn->setStyleSheet(R"(
+            QPushButton { background-color: #3a3a3a; border: 1px solid #505050; border-radius: 8px; }
+            QPushButton:hover { background-color: #454545; border-color: #606060; }
+            QPushButton:pressed { background-color: #333333; }
+        )");
+        // Shortcut sheet, set apart at the bottom: it helps rather than acts.
+        QFrame *helpSeparator = new QFrame(m_actionPanel);
+        helpSeparator->setFixedHeight(1);
+        helpSeparator->setStyleSheet(QStringLiteral("background: #404040; border: none;"));
+        actionLayout->addSpacing(2);
+        actionLayout->addWidget(helpSeparator);
+        actionLayout->addSpacing(2);
+        m_helpButton = addBtn(":/icons/help.svg", QString(), [this]() { toggleShortcutSheet(); });
+        m_helpButton->setToolTip(QStringLiteral("<b>%1</b>&nbsp;&nbsp;<span style='color:#a8a8a8'>? / F1</span>")
+                                     .arg(TranslationManager::tr("sheetTitle").toHtmlEscaped()));
+        m_helpButton->setStyleSheet(R"(
+            QPushButton { background-color: #3a3a3a; border: 1px solid #505050; border-radius: 8px; }
+            QPushButton:hover { background-color: #454545; border-color: #606060; }
+            QPushButton:pressed { background-color: #333333; }
+        )");
+
+    }
+    m_actionPanel->hide();
+
+    m_captureDelayTimer = new QTimer(this);
+    m_captureDelayTimer->setSingleShot(true);
+    connect(m_captureDelayTimer, &QTimer::timeout, this, &CaptureOverlay::performCapture);
+
+    m_windowSnapAnimation = new QVariantAnimation(this);
+    m_windowSnapAnimation->setDuration(windowSnapAnimationDurationMs());
+    m_windowSnapAnimation->setStartValue(0.0);
+    m_windowSnapAnimation->setEndValue(1.0);
+    connect(m_windowSnapAnimation, &QVariantAnimation::valueChanged,
+            this, [this](const QVariant &value) {
+                m_animatedWindowRect = windowSnapTransitionRect(
+                    m_windowSnapAnimationStart, m_hoveredWindowRect, value.toReal());
+                update();
+            });
+    connect(m_windowSnapAnimation, &QVariantAnimation::finished, this, [this]() {
+        m_animatedWindowRect = m_hoveredWindowRect;
+        update();
+    });
+
+    QApplication::instance()->installEventFilter(this);
+    for (QWidget *widget : findChildren<QWidget *>())
+        widget->setAttribute(Qt::WA_AlwaysShowToolTips, true);
+
+}
+
+CaptureOverlay::~CaptureOverlay()
+{
+    delete m_screenViews;
+    m_screenViews = nullptr;
+    delete m_textFocusProxy;
+    m_textFocusProxy = nullptr;
+    if (m_googleLensUploader) {
+        m_googleLensUploader->disconnect(this);
+        m_googleLensUploader->cancel();
+    }
+    if (!m_visualSearchImagePath.isEmpty())
+        QFile::remove(m_visualSearchImagePath);
+}
+
+void CaptureOverlay::setupToolSettingsDrawer()
+{
+    m_toolSettingsButton = new SideTabButton(TranslationManager::quickSettings(), this);
+    m_toolSettingsButton->setToolTip(TranslationManager::quickSettings());
+    m_toolSettingsButton->setCursor(Qt::PointingHandCursor);
+    m_toolSettingsButton->hide();
+    connect(m_toolSettingsButton, &QPushButton::clicked, this, [this]() {
+        setToolSettingsDrawerVisible(m_toolSettingsDrawer && !m_toolSettingsDrawer->isVisible());
+    });
+
+    m_toolSettingsDrawer = new QWidget(this);
+    m_toolSettingsDrawer->setObjectName(QStringLiteral("toolSettingsDrawer"));
+    m_toolSettingsDrawer->setFixedWidth(258);
+    m_toolSettingsDrawer->setStyleSheet(overlayPanelStyleSheet());
+
+    const OverlayPanelMetrics panelMetrics = overlayPanelMetrics();
+    QVBoxLayout *drawerLayout = new QVBoxLayout(m_toolSettingsDrawer);
+    drawerLayout->setContentsMargins(panelMetrics.contentMargin, 10,
+                                      panelMetrics.contentMargin, panelMetrics.contentMargin);
+    drawerLayout->setSpacing(panelMetrics.rowSpacing);
+
+    QLabel *title = new QLabel(TranslationManager::quickSettings(), m_toolSettingsDrawer);
+    title->setProperty("panelRole", QStringLiteral("title"));
+    drawerLayout->addWidget(title);
+    addOverlayPanelSection(drawerLayout, m_toolSettingsDrawer,
+                           TranslationManager::drawingTools(), false);
+
+    auto addSliderRow = [&](const QString &label, QSlider *&slider, QLabel *&valueLabel, int min, int max, int value) {
+        QLabel *rowLabel = new QLabel(label, m_toolSettingsDrawer);
+        slider = new QSlider(Qt::Horizontal, m_toolSettingsDrawer);
+        slider->setRange(min, max);
+        slider->setValue(value);
+        valueLabel = new QLabel(QString::number(value), m_toolSettingsDrawer);
+        valueLabel->setProperty("panelRole", QStringLiteral("value"));
+        valueLabel->setFixedWidth(34);
+        drawerLayout->addWidget(rowLabel);
+        auto *valueRow = new QHBoxLayout();
+        valueRow->setContentsMargins(0, 0, 0, 0);
+        valueRow->setSpacing(7);
+        valueRow->addWidget(slider, 1);
+        valueRow->addWidget(valueLabel);
+        drawerLayout->addLayout(valueRow);
+    };
+
+    addSliderRow(TranslationManager::quickPenWidth(), m_quickPenWidthSlider, m_quickPenWidthValueLabel, 1, 20, 3);
+    addSliderRow(TranslationManager::quickBlurIntensity(), m_quickBlurSlider, m_quickBlurValueLabel, 4, 64, 16);
+
+    // Counter options. The pointer thickness is the width slider above, like
+    // the Arrow tool's.
+    m_quickCounterOptions = new QWidget(m_toolSettingsDrawer);
+    auto *counterLayout = new QVBoxLayout(m_quickCounterOptions);
+    counterLayout->setContentsMargins(0, 0, 0, 0);
+    counterLayout->setSpacing(panelMetrics.rowSpacing);
+    auto *counterStartRow = new QHBoxLayout();
+    counterStartRow->addWidget(new QLabel(TranslationManager::tr("quickCounterStart"), m_quickCounterOptions));
+    m_quickCounterStartSpin = new QSpinBox(m_quickCounterOptions);
+    m_quickCounterStartSpin->setRange(CounterGeometry::MinStartValue, CounterGeometry::MaxStartValue);
+    m_quickCounterStartSpin->setToolTip(TranslationManager::tr("quickCounterStartHint"));
+    configureOverlaySpinBox(m_quickCounterStartSpin);
+    m_quickCounterStartSpin->setFixedWidth(96);
+    counterStartRow->addWidget(m_quickCounterStartSpin);
+    counterLayout->addLayout(counterStartRow);
+    counterLayout->addWidget(new QLabel(TranslationManager::tr("quickCounterSize"), m_quickCounterOptions));
+    m_quickCounterSizeSlider = new QSlider(Qt::Horizontal, m_quickCounterOptions);
+    m_quickCounterSizeSlider->setRange(CounterGeometry::MinDiameter, CounterGeometry::MaxDiameter);
+    m_quickCounterSizeSlider->setValue(CounterGeometry::DefaultDiameter);
+    m_quickCounterSizeValueLabel = new QLabel(QString::number(CounterGeometry::DefaultDiameter),
+                                              m_quickCounterOptions);
+    m_quickCounterSizeValueLabel->setProperty("panelRole", QStringLiteral("value"));
+    m_quickCounterSizeValueLabel->setFixedWidth(34);
+    auto *counterSizeRow = new QHBoxLayout();
+    counterSizeRow->setContentsMargins(0, 0, 0, 0);
+    counterSizeRow->setSpacing(7);
+    counterSizeRow->addWidget(m_quickCounterSizeSlider, 1);
+    counterSizeRow->addWidget(m_quickCounterSizeValueLabel);
+    counterLayout->addLayout(counterSizeRow);
+    drawerLayout->addWidget(m_quickCounterOptions);
+    m_quickCounterOptions->hide();
+
+    addOverlayPanelSection(drawerLayout, m_toolSettingsDrawer,
+                           TranslationManager::tr("sheetSectionSelection"));
+    m_quickAutoLockSelectionCheck = new QCheckBox(TranslationManager::tr("autoLockSelection"),
+                                                  m_toolSettingsDrawer);
+    m_quickAutoLockSelectionCheck->setToolTip(TranslationManager::tr("autoLockSelectionTip"));
+    drawerLayout->addWidget(m_quickAutoLockSelectionCheck);
+    // Applies from the next finished selection; the current lock stays as is.
+    connect(m_quickAutoLockSelectionCheck, &QCheckBox::toggled, this, [this](bool enabled) {
+        m_autoLockSelection = enabled;
+        QSettings s("EShot", "EShot");
+        s.setValue("autoLockSelection", enabled);
+    });
+
+    connect(m_quickPenWidthSlider, &QSlider::valueChanged, this, [this](int value) {
+        if (m_quickPenWidthValueLabel)
+            m_quickPenWidthValueLabel->setText(QString::number(value));
+        if (m_annotationEngine) m_annotationEngine->setPenWidth(value);
+        if (m_settingsWriter)
+            m_settingsWriter->schedule(QStringLiteral("annotationPenWidth"), value);
+    });
+    connect(m_quickCounterStartSpin, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        if (m_annotationEngine) m_annotationEngine->setCounterStartValue(value);
+        if (m_settingsWriter)
+            m_settingsWriter->schedule(QStringLiteral("counterStartValue"), value);
+    });
+    connect(m_quickCounterSizeSlider, &QSlider::valueChanged, this, [this](int value) {
+        if (m_quickCounterSizeValueLabel)
+            m_quickCounterSizeValueLabel->setText(QString::number(value));
+        if (m_annotationEngine) m_annotationEngine->setCounterDiameter(value);
+        if (m_settingsWriter)
+            m_settingsWriter->schedule(QStringLiteral("counterSize"), value);
+    });
+    connect(m_quickBlurSlider, &QSlider::valueChanged, this, [this](int value) {
+        if (m_quickBlurValueLabel)
+            m_quickBlurValueLabel->setText(QString::number(value));
+        if (m_annotationEngine) m_annotationEngine->setBlurIntensity(value);
+        if (m_settingsWriter)
+            m_settingsWriter->schedule(QStringLiteral("blurIntensity"), value);
+    });
+    m_toolSettingsDrawer->hide();
+
+    const int drawerAnimationDurationMs = overlayPanelMetrics().drawerAnimationDurationMs;
+    m_toolSettingsAnimation = new QPropertyAnimation(m_toolSettingsDrawer, "geometry", this);
+    m_toolSettingsAnimation->setDuration(drawerAnimationDurationMs);
+    m_toolSettingsAnimation->setEasingCurve(QEasingCurve::OutCubic);
+    connect(m_toolSettingsAnimation, &QPropertyAnimation::finished, this, [this]() {
+        if (m_toolSettingsDrawer && m_toolSettingsDrawer->property("closing").toBool()) {
+            m_toolSettingsDrawer->hide();
+            m_toolSettingsDrawer->setProperty("closing", false);
+        }
+        if (m_toolSettingsButton)
+            m_toolSettingsButton->raise();
+    });
+
+    m_toolSettingsButtonAnimation = new QPropertyAnimation(m_toolSettingsButton, "geometry", this);
+    m_toolSettingsButtonAnimation->setDuration(drawerAnimationDurationMs);
+    m_toolSettingsButtonAnimation->setEasingCurve(QEasingCurve::OutCubic);
+}
+
+void CaptureOverlay::setupRecordingDrawer()
+{
+    m_recordingDrawer = new QWidget(this);
+    m_recordingDrawer->setObjectName(QStringLiteral("recordingDrawer"));
+    m_recordingDrawer->setFixedWidth(320);
+    m_recordingDrawer->setStyleSheet(overlayPanelStyleSheet());
+
+    const OverlayPanelMetrics panelMetrics = overlayPanelMetrics();
+    auto *layout = new QVBoxLayout(m_recordingDrawer);
+    layout->setContentsMargins(panelMetrics.contentMargin, panelMetrics.contentMargin,
+                               panelMetrics.contentMargin, panelMetrics.contentMargin);
+    layout->setSpacing(panelMetrics.rowSpacing);
+    auto *title = new QLabel(TranslationManager::tabRecording(), m_recordingDrawer);
+    title->setObjectName(QStringLiteral("recordingDrawerTitle"));
+    title->setProperty("panelRole", QStringLiteral("title"));
+    layout->addWidget(title);
+
+    // GIF ⇄ Video segmented switch.
+    auto *modeRow = new QHBoxLayout();
+    modeRow->setContentsMargins(0, 0, 0, 0);
+    modeRow->setSpacing(0);
+    auto makeSegment = [this](const QString &text, const QString &position) {
+        auto *button = new QPushButton(text, m_recordingDrawer);
+        button->setCheckable(true);
+        button->setAutoDefault(false);
+        button->setCursor(Qt::PointingHandCursor);
+        button->setProperty("panelSegment", position);
+        return button;
+    };
+    m_recordingGifModeButton = makeSegment(QStringLiteral("GIF"), QStringLiteral("first"));
+    m_recordingVideoModeButton = makeSegment(TranslationManager::tr("recSegmentVideo"),
+                                             QStringLiteral("last"));
+    m_recordingGifModeButton->setObjectName(QStringLiteral("recordingGifModeButton"));
+    m_recordingVideoModeButton->setObjectName(QStringLiteral("recordingVideoModeButton"));
+    auto *modeGroup = new QButtonGroup(m_recordingDrawer);
+    modeGroup->setExclusive(true);
+    modeGroup->addButton(m_recordingGifModeButton);
+    modeGroup->addButton(m_recordingVideoModeButton);
+    modeRow->addWidget(m_recordingGifModeButton, 1);
+    modeRow->addWidget(m_recordingVideoModeButton, 1);
+    layout->addLayout(modeRow);
+
+    auto *form = new QFormLayout();
+    form->setContentsMargins(0, 2, 0, 0);
+    form->setHorizontalSpacing(10);
+    form->setVerticalSpacing(panelMetrics.rowSpacing);
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    form->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    // Long labels (e.g. Russian) move above their field instead of
+    // squeezing the choices.
+    form->setRowWrapPolicy(QFormLayout::WrapLongRows);
+    m_recordingQualityCombo = new QComboBox(m_recordingDrawer);
+    m_recordingQualityCombo->setObjectName(QStringLiteral("recordingQualityCombo"));
+    m_recordingDurationCombo = new QComboBox(m_recordingDrawer);
+    m_recordingDurationCombo->setObjectName(QStringLiteral("recordingDurationCombo"));
+    m_recordingStartDelayCombo = new QComboBox(m_recordingDrawer);
+    m_recordingStartDelayCombo->setObjectName(QStringLiteral("recordingStartDelayCombo"));
+    m_recordingStartDelayCombo->setToolTip(TranslationManager::tr("tipRecordingStartDelay"));
+    for (QComboBox *combo : {m_recordingQualityCombo, m_recordingDurationCombo, m_recordingStartDelayCombo})
+        combo->setMinimumWidth(170);
+    for (int seconds : recordingStartDelayChoices()) {
+        m_recordingStartDelayCombo->addItem(seconds == 0 ? TranslationManager::noDelay()
+                                                         : recordingSecondsText(seconds),
+                                            seconds);
+    }
+    form->addRow(TranslationManager::tr("recQualityLabel"), m_recordingQualityCombo);
+
+    // "Custom" quality: the raw values, edited right here.
+    m_recordingCustomQuality = new QWidget(m_recordingDrawer);
+    m_recordingCustomQuality->setObjectName(QStringLiteral("recordingCustomQuality"));
+    auto *customLayout = new QVBoxLayout(m_recordingCustomQuality);
+    customLayout->setContentsMargins(0, 0, 0, 0);
+    customLayout->setSpacing(panelMetrics.rowSpacing);
+    auto makeSliderRow = [](QSlider **slider, QLabel **value, QWidget *parent) {
+        auto *row = new QHBoxLayout();
+        row->setContentsMargins(0, 0, 0, 0);
+        row->setSpacing(8);
+        *slider = new QSlider(Qt::Horizontal, parent);
+        (*slider)->setCursor(Qt::PointingHandCursor);
+        *value = new QLabel(parent);
+        (*value)->setProperty("panelRole", QStringLiteral("value"));
+        (*value)->setMinimumWidth(54);
+        (*value)->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        row->addWidget(*slider, 1);
+        row->addWidget(*value);
+        return row;
+    };
+    auto makeCustomForm = [&panelMetrics](QWidget *parent) {
+        auto *customForm = new QFormLayout(parent);
+        customForm->setContentsMargins(0, 0, 0, 0);
+        customForm->setHorizontalSpacing(10);
+        customForm->setVerticalSpacing(panelMetrics.rowSpacing);
+        customForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        customForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        customForm->setRowWrapPolicy(QFormLayout::WrapLongRows);
+        return customForm;
+    };
+
+    m_recordingCustomGif = new QWidget(m_recordingCustomQuality);
+    m_recordingCustomGif->setObjectName(QStringLiteral("recordingCustomGif"));
+    auto *gifForm = makeCustomForm(m_recordingCustomGif);
+    auto *gifFpsRow = makeSliderRow(&m_recordingGifFpsSlider, &m_recordingGifFpsValue,
+                                    m_recordingCustomGif);
+    m_recordingGifFpsSlider->setObjectName(QStringLiteral("recordingGifFpsSlider"));
+    m_recordingGifFpsSlider->setRange(1, gifRecordingFpsLimit());
+    m_recordingGifFpsSlider->setToolTip(TranslationManager::tr("tipGifFps"));
+    gifForm->addRow(QStringLiteral("FPS"), gifFpsRow);
+    m_recordingGifMaxSideCombo = new QComboBox(m_recordingCustomGif);
+    m_recordingGifMaxSideCombo->setObjectName(QStringLiteral("recordingGifMaxSideCombo"));
+    m_recordingGifMaxSideCombo->setToolTip(TranslationManager::tr("tipGifSizePreset"));
+    gifForm->addRow(withoutTrailingColon(TranslationManager::tr("recMaxSideLabel")),
+                    m_recordingGifMaxSideCombo);
+    customLayout->addWidget(m_recordingCustomGif);
+
+    m_recordingCustomVideo = new QWidget(m_recordingCustomQuality);
+    m_recordingCustomVideo->setObjectName(QStringLiteral("recordingCustomVideo"));
+    auto *videoForm = makeCustomForm(m_recordingCustomVideo);
+    auto *videoFpsRow = makeSliderRow(&m_recordingVideoFpsSlider, &m_recordingVideoFpsValue,
+                                      m_recordingCustomVideo);
+    m_recordingVideoFpsSlider->setObjectName(QStringLiteral("recordingVideoFpsSlider"));
+    m_recordingVideoFpsSlider->setRange(1, videoRecordingFpsLimit());
+    m_recordingVideoFpsSlider->setToolTip(TranslationManager::tr("tipVideoFps"));
+    videoForm->addRow(QStringLiteral("FPS"), videoFpsRow);
+    auto *videoQualityRow = makeSliderRow(&m_recordingVideoQualitySlider,
+                                          &m_recordingVideoQualityValue, m_recordingCustomVideo);
+    m_recordingVideoQualitySlider->setObjectName(QStringLiteral("recordingVideoQualitySlider"));
+    m_recordingVideoQualitySlider->setRange(MinVideoCrf, MaxVideoCrf);
+    m_recordingVideoQualitySlider->setToolTip(TranslationManager::videoCrfHint());
+    videoForm->addRow(TranslationManager::tr("recQualityLabel"), videoQualityRow);
+    auto *videoQualityHint = new QLabel(TranslationManager::tr("recCustomVideoQualityHint"),
+                                        m_recordingCustomVideo);
+    videoQualityHint->setObjectName(QStringLiteral("recordingVideoQualityHint"));
+    videoQualityHint->setProperty("panelRole", QStringLiteral("hint"));
+    videoQualityHint->setWordWrap(true);
+    videoForm->addRow(videoQualityHint);
+    customLayout->addWidget(m_recordingCustomVideo);
+    form->addRow(m_recordingCustomQuality);
+    m_recordingCustomQuality->hide();
+
+    form->addRow(TranslationManager::tr("recDurationLabel"), m_recordingDurationCombo);
+    form->addRow(withoutTrailingColon(TranslationManager::tr("recordingStartDelayLabel")),
+                 m_recordingStartDelayCombo);
+    layout->addLayout(form);
+
+    // Video only: audio sources. Volumes and the system audio device are on
+    // the Settings recording tab.
+    m_recordingVideoOptions = new QWidget(m_recordingDrawer);
+    auto *videoLayout = new QVBoxLayout(m_recordingVideoOptions);
+    videoLayout->setContentsMargins(0, 0, 0, 0);
+    videoLayout->setSpacing(panelMetrics.rowSpacing);
+    addOverlayPanelSection(videoLayout, m_recordingVideoOptions, TranslationManager::audioMode());
+    m_recordingDesktopAudioCheck = new QCheckBox(TranslationManager::audioSystemLoopback(),
+                                                 m_recordingVideoOptions);
+    m_recordingDesktopAudioCheck->setToolTip(TranslationManager::tr("tipVideoDesktopAudio"));
+    m_recordingMicrophoneCheck = new QCheckBox(TranslationManager::audioMicrophone(),
+                                               m_recordingVideoOptions);
+    m_recordingMicrophoneCheck->setToolTip(TranslationManager::tr("tipVideoMicrophone"));
+    m_recordingMicrophoneDeviceCombo = new QComboBox(m_recordingVideoOptions);
+    m_recordingMicrophoneDeviceCombo->setObjectName(QStringLiteral("recordingMicrophoneDeviceCombo"));
+    m_recordingMicrophoneDeviceCombo->setToolTip(TranslationManager::tr("tipVideoMicrophoneDevice"));
+    m_recordingMicrophoneDeviceCombo->addItem(TranslationManager::tr("defaultAudioDevice"),
+                                              QStringLiteral("default"));
+    videoLayout->addWidget(m_recordingDesktopAudioCheck);
+    videoLayout->addWidget(m_recordingMicrophoneCheck);
+    auto *deviceRow = new QHBoxLayout();
+    deviceRow->setContentsMargins(21, 0, 0, 0);
+    deviceRow->addWidget(m_recordingMicrophoneDeviceCombo, 1);
+    videoLayout->addLayout(deviceRow);
+    layout->addWidget(m_recordingVideoOptions);
+
+    auto *advancedButton = new QPushButton(TranslationManager::tr("recAdvancedSettings"), m_recordingDrawer);
+    advancedButton->setObjectName(QStringLiteral("recordingAdvancedSettingsButton"));
+    advancedButton->setProperty("panelAction", QStringLiteral("link"));
+    advancedButton->setAutoDefault(false);
+    advancedButton->setCursor(Qt::PointingHandCursor);
+    auto *advancedRow = new QHBoxLayout();
+    advancedRow->setContentsMargins(0, 0, 0, 0);
+    advancedRow->addWidget(advancedButton);
+    advancedRow->addStretch(1);
+    layout->addLayout(advancedRow);
+
+    m_recordingHotkeyHint = new QLabel(m_recordingDrawer);
+    m_recordingHotkeyHint->setObjectName(QStringLiteral("recordingHotkeyHint"));
+    m_recordingHotkeyHint->setProperty("panelRole", QStringLiteral("hint"));
+    m_recordingHotkeyHint->setWordWrap(true);
+    layout->addWidget(m_recordingHotkeyHint);
+
+    m_recordingStartButton = new QPushButton(TranslationManager::recordingStart(), m_recordingDrawer);
+    m_recordingStartButton->setObjectName(QStringLiteral("recordingStartButton"));
+    m_recordingStartButton->setProperty("panelAction", QStringLiteral("primary"));
+    m_recordingStartButton->setToolTip(QStringLiteral("%1 (Enter)").arg(TranslationManager::recordingStart()));
+    // Enter on a focused button clicks that button (outside a dialog Qt
+    // leaves autoDefault off); elsewhere in the drawer Enter starts.
+    m_recordingStartButton->setAutoDefault(true);
+    m_recordingStartButton->setDefault(true);
+    m_recordingCancelButton = new QPushButton(TranslationManager::recordingCancel(), m_recordingDrawer);
+    m_recordingCancelButton->setObjectName(QStringLiteral("recordingCancelButton"));
+    m_recordingCancelButton->setProperty("panelAction", QStringLiteral("secondary"));
+    m_recordingCancelButton->setAutoDefault(true);
+    layout->addWidget(m_recordingStartButton);
+    layout->addWidget(m_recordingCancelButton);
+
+    connect(m_recordingGifModeButton, &QPushButton::clicked, this, [this]() {
+        setRecordingDrawerMode(RecordingDrawerMode::Gif);
+    });
+    connect(m_recordingVideoModeButton, &QPushButton::clicked, this, [this]() {
+        setRecordingDrawerMode(RecordingDrawerMode::Video);
+    });
+    connect(m_recordingQualityCombo, qOverload<int>(&QComboBox::activated), this, [this](int index) {
+        const auto preset = static_cast<RecordingQualityPreset>(
+            m_recordingQualityCombo->itemData(index).toInt());
+        // A named preset writes its values; "Custom" keeps the current ones
+        // and shows them for editing. Either way the choice is remembered.
+        QSettings settings("EShot", "EShot");
+        if (m_recordingDrawerMode == RecordingDrawerMode::Gif)
+            applyGifQualityPreset(settings, preset);
+        else
+            applyVideoQualityPreset(settings, preset);
+        loadRecordingCustomQualityValues();
+        updateRecordingCustomQualityVisibility();
+    });
+    connect(m_recordingGifFpsSlider, &QSlider::valueChanged, this, [this]() {
+        saveRecordingCustomQualityValues();
+    });
+    connect(m_recordingGifMaxSideCombo, qOverload<int>(&QComboBox::activated), this, [this](int) {
+        saveRecordingCustomQualityValues();
+    });
+    connect(m_recordingVideoFpsSlider, &QSlider::valueChanged, this, [this]() {
+        saveRecordingCustomQualityValues();
+    });
+    connect(m_recordingVideoQualitySlider, &QSlider::valueChanged, this, [this]() {
+        saveRecordingCustomQualityValues();
+    });
+    connect(m_recordingDurationCombo, qOverload<int>(&QComboBox::activated), this, [this](int index) {
+        QSettings("EShot", "EShot").setValue(
+            m_recordingDrawerMode == RecordingDrawerMode::Gif
+                ? QStringLiteral("recordingMaxSeconds") : QStringLiteral("videoRecordingMaxSeconds"),
+            m_recordingDurationCombo->itemData(index).toInt());
+    });
+    connect(m_recordingStartDelayCombo, qOverload<int>(&QComboBox::activated), this, [this](int index) {
+        QSettings("EShot", "EShot").setValue(QStringLiteral("recordingStartDelaySeconds"),
+                                             m_recordingStartDelayCombo->itemData(index).toInt());
+    });
+    connect(m_recordingDesktopAudioCheck, &QCheckBox::toggled, this, [](bool enabled) {
+        QSettings("EShot", "EShot").setValue("videoDesktopAudioEnabled", enabled);
+    });
+    connect(m_recordingMicrophoneCheck, &QCheckBox::toggled, this, [this](bool enabled) {
+        QSettings("EShot", "EShot").setValue("videoMicrophoneEnabled", enabled);
+        if (m_recordingMicrophoneDeviceCombo)
+            m_recordingMicrophoneDeviceCombo->setEnabled(enabled);
+    });
+    connect(m_recordingMicrophoneDeviceCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
+        QSettings("EShot", "EShot").setValue(
+            "videoMicrophoneDevice", m_recordingMicrophoneDeviceCombo->currentData().toString());
+    });
+    connect(advancedButton, &QPushButton::clicked, this, &CaptureOverlay::openRecordingSettings);
+    connect(m_recordingStartButton, &QPushButton::clicked, this, &CaptureOverlay::startRecordingFromDrawer);
+    connect(m_recordingCancelButton, &QPushButton::clicked, this, [this] { hideRecordingDrawer(); });
+    m_recordingDrawer->hide();
+}
+
+void CaptureOverlay::showRecordingDrawer(RecordingDrawerMode mode)
+{
+    if (!m_recordingDrawer || !m_selectionComplete || mode == RecordingDrawerMode::None)
+        return;
+
+    setToolSettingsDrawerVisible(false);
+    if (m_toolbar)
+        m_toolbar->hide();
+    if (m_actionPanel)
+        m_actionPanel->hide();
+    if (m_toolSettingsButton)
+        m_toolSettingsButton->hide();
+    if (m_toolSettingsDrawer)
+        m_toolSettingsDrawer->hide();
+    setRecordingDrawerMode(mode);
+    m_recordingDrawer->show();
+    m_recordingDrawer->raise();
+    if (m_recordingStartButton)
+        m_recordingStartButton->setFocus(Qt::OtherFocusReason);
+}
+
+void CaptureOverlay::setRecordingDrawerMode(RecordingDrawerMode mode)
+{
+    if (!m_recordingDrawer || mode == RecordingDrawerMode::None)
+        return;
+    m_recordingDrawerMode = mode;
+    QSettings("EShot", "EShot").setValue(QStringLiteral("recordingDrawerMode"),
+                                         recordingDrawerModeKey(mode));
+    const QStringList fields = recordingDrawerFields(mode);
+    if (mode == RecordingDrawerMode::Video)
+        ensureAudioDevicesLoaded();
+    m_recordingVideoOptions->setVisible(fields.contains(QStringLiteral("systemAudio")));
+    {
+        QSignalBlocker gifBlocker(m_recordingGifModeButton);
+        QSignalBlocker videoBlocker(m_recordingVideoModeButton);
+        m_recordingGifModeButton->setChecked(mode == RecordingDrawerMode::Gif);
+        m_recordingVideoModeButton->setChecked(mode == RecordingDrawerMode::Video);
+    }
+    loadRecordingDrawerValues();
+    placeRecordingDrawer();
+}
+
+void CaptureOverlay::loadRecordingDrawerValues()
+{
+    if (!m_recordingDrawer)
+        return;
+    const bool gif = m_recordingDrawerMode == RecordingDrawerMode::Gif;
+    QSettings settings("EShot", "EShot");
+
+    QSignalBlocker qualityBlocker(m_recordingQualityCombo);
+    QSignalBlocker durationBlocker(m_recordingDurationCombo);
+    QSignalBlocker delayBlocker(m_recordingStartDelayCombo);
+    QSignalBlocker desktopAudioBlocker(m_recordingDesktopAudioCheck);
+    QSignalBlocker microphoneBlocker(m_recordingMicrophoneCheck);
+    QSignalBlocker microphoneDeviceBlocker(m_recordingMicrophoneDeviceCombo);
+
+    m_recordingQualityCombo->clear();
+    for (RecordingQualityPreset preset : selectableRecordingQualityPresets()) {
+        m_recordingQualityCombo->addItem(recordingQualityPresetText(preset), static_cast<int>(preset));
+        m_recordingQualityCombo->setItemData(m_recordingQualityCombo->count() - 1,
+                                             recordingQualityPresetDetails(preset, gif),
+                                             Qt::ToolTipRole);
+    }
+    // "Custom" is always offered; choosing it shows the values to edit.
+    m_recordingQualityCombo->addItem(recordingQualityPresetText(RecordingQualityPreset::Custom),
+                                     static_cast<int>(RecordingQualityPreset::Custom));
+    m_recordingQualityCombo->setItemData(m_recordingQualityCombo->count() - 1,
+                                         TranslationManager::tr("recCustomQualityTip"),
+                                         Qt::ToolTipRole);
+    const RecordingQualityPreset current = gif ? loadGifQualityPreset(settings)
+                                               : loadVideoQualityPreset(settings);
+    m_recordingQualityCombo->setCurrentIndex(
+        qMax(0, m_recordingQualityCombo->findData(static_cast<int>(current))));
+    m_recordingQualityCombo->setToolTip(TranslationManager::tr("tipRecQualityPreset"));
+    loadRecordingCustomQualityValues();
+    updateRecordingCustomQualityVisibility();
+
+    const int maxSeconds = gif
+        ? settings.value("recordingMaxSeconds", DefaultGifMaxSeconds).toInt()
+        : settings.value("videoRecordingMaxSeconds", DefaultVideoMaxSeconds).toInt();
+    m_recordingDurationCombo->clear();
+    for (int seconds : recordingDurationChoices()) {
+        m_recordingDurationCombo->addItem(seconds == 0 ? TranslationManager::recordingUnlimited()
+                                                       : recordingSecondsText(seconds),
+                                          seconds);
+    }
+    if (recordingChoiceIndex(recordingDurationChoices(), maxSeconds) < 0) {
+        m_recordingDurationCombo->addItem(
+            TranslationManager::tr("recCustomValue").arg(recordingSecondsText(maxSeconds)), maxSeconds);
+    }
+    m_recordingDurationCombo->setCurrentIndex(qMax(0, m_recordingDurationCombo->findData(maxSeconds)));
+    m_recordingDurationCombo->setToolTip(TranslationManager::tr(gif ? "tipGifMaxSeconds"
+                                                                    : "tipVideoMaxSeconds"));
+
+    const int delay = settings.value("recordingStartDelaySeconds", 0).toInt();
+    const int customDelay = m_recordingStartDelayCombo->findData(QStringLiteral("custom"), Qt::UserRole + 1);
+    if (customDelay >= 0)
+        m_recordingStartDelayCombo->removeItem(customDelay);
+    if (recordingChoiceIndex(recordingStartDelayChoices(), delay) < 0) {
+        m_recordingStartDelayCombo->addItem(
+            TranslationManager::tr("recCustomValue").arg(recordingSecondsText(delay)), delay);
+        m_recordingStartDelayCombo->setItemData(m_recordingStartDelayCombo->count() - 1,
+                                                QStringLiteral("custom"), Qt::UserRole + 1);
+    }
+    m_recordingStartDelayCombo->setCurrentIndex(qMax(0, m_recordingStartDelayCombo->findData(delay)));
+
+    if (!gif) {
+        m_recordingDesktopAudioCheck->setChecked(loadRecordingAudioEnabled(settings, RecordingAudioSource::Desktop));
+        m_recordingMicrophoneCheck->setChecked(loadRecordingAudioEnabled(settings, RecordingAudioSource::Microphone));
+        const int microphoneDeviceIndex = m_recordingMicrophoneDeviceCombo->findData(
+            settings.value("videoMicrophoneDevice", "default").toString());
+        m_recordingMicrophoneDeviceCombo->setCurrentIndex(microphoneDeviceIndex < 0 ? 0 : microphoneDeviceIndex);
+        m_recordingMicrophoneDeviceCombo->setEnabled(m_recordingMicrophoneCheck->isChecked());
+    }
+
+    const HotkeyManager &hotkeys = HotkeyManager::instance();
+    auto keyText = [](const QString &shortcut) {
+        return shortcut.trimmed().isEmpty() ? TranslationManager::hotkeyNoneActive() : shortcut;
+    };
+    m_recordingHotkeyHint->setText(TranslationManager::tr("recDrawerHotkeys").arg(
+        keyText(hotkeys.recordingStopShortcutText()),
+        keyText(hotkeys.recordingPauseShortcutText())));
+}
+
+// Fills the custom fields from the raw keys (also after a preset changed
+// them, so "Custom" starts from the values that were just in use).
+void CaptureOverlay::loadRecordingCustomQualityValues()
+{
+    if (!m_recordingCustomQuality)
+        return;
+    QSettings settings("EShot", "EShot");
+    const QSignalBlocker gifFpsBlocker(m_recordingGifFpsSlider);
+    const QSignalBlocker maxSideBlocker(m_recordingGifMaxSideCombo);
+    const QSignalBlocker videoFpsBlocker(m_recordingVideoFpsSlider);
+    const QSignalBlocker qualityBlocker(m_recordingVideoQualitySlider);
+
+    const int gifFps = qBound(1, settings.value("recordingFps", DefaultGifFps).toInt(),
+                              gifRecordingFpsLimit());
+    m_recordingGifFpsSlider->setValue(gifFps);
+    m_recordingGifFpsValue->setText(QStringLiteral("%1 FPS").arg(gifFps));
+    const int maxSide = settings.value("recordingMaxSide", DefaultGifMaxSide).toInt();
+    m_recordingGifMaxSideCombo->clear();
+    QList<int> sides = gifMaxSideChoices();
+    if (maxSide > 0 && !sides.contains(maxSide)) {
+        // A value set elsewhere stays selectable as is.
+        sides.append(maxSide);
+        std::sort(sides.begin(), sides.end());
+    }
+    for (int side : std::as_const(sides))
+        m_recordingGifMaxSideCombo->addItem(QStringLiteral("%1 px").arg(side), side);
+    m_recordingGifMaxSideCombo->setCurrentIndex(qMax(0, m_recordingGifMaxSideCombo->findData(
+        maxSide > 0 ? maxSide : DefaultGifMaxSide)));
+
+    const int videoFps = qBound(1, settings.value("videoRecordingFps", DefaultVideoFps).toInt(),
+                                videoRecordingFpsLimit());
+    m_recordingVideoFpsSlider->setValue(videoFps);
+    m_recordingVideoFpsValue->setText(QStringLiteral("%1 FPS").arg(videoFps));
+    const int crf = qBound(MinVideoCrf, settings.value("videoRecordingCrf", DefaultVideoCrf).toInt(),
+                           MaxVideoCrf);
+    m_recordingVideoQualitySlider->setValue(videoQualitySliderValue(crf));
+    m_recordingVideoQualityValue->setText(QStringLiteral("CRF %1").arg(crf));
+}
+
+// Edited custom values go straight to the keys the recorders read, and the
+// quality stays "Custom" even when they happen to match a preset.
+void CaptureOverlay::saveRecordingCustomQualityValues()
+{
+    if (!m_recordingCustomQuality)
+        return;
+    QSettings settings("EShot", "EShot");
+    if (m_recordingDrawerMode == RecordingDrawerMode::Gif) {
+        const int fps = m_recordingGifFpsSlider->value();
+        m_recordingGifFpsValue->setText(QStringLiteral("%1 FPS").arg(fps));
+        settings.setValue("recordingFps", fps);
+        settings.setValue("recordingMaxSide", m_recordingGifMaxSideCombo->currentData().toInt());
+        applyGifQualityPreset(settings, RecordingQualityPreset::Custom);
+    } else if (m_recordingDrawerMode == RecordingDrawerMode::Video) {
+        const int fps = m_recordingVideoFpsSlider->value();
+        const int crf = videoCrfFromQualitySlider(m_recordingVideoQualitySlider->value());
+        m_recordingVideoFpsValue->setText(QStringLiteral("%1 FPS").arg(fps));
+        m_recordingVideoQualityValue->setText(QStringLiteral("CRF %1").arg(crf));
+        settings.setValue("videoRecordingFps", fps);
+        settings.setValue("videoRecordingCrf", crf);
+        applyVideoQualityPreset(settings, RecordingQualityPreset::Custom);
+    }
+}
+
+void CaptureOverlay::updateRecordingCustomQualityVisibility()
+{
+    if (!m_recordingCustomQuality || !m_recordingQualityCombo)
+        return;
+    const bool custom = static_cast<RecordingQualityPreset>(
+        m_recordingQualityCombo->currentData().toInt()) == RecordingQualityPreset::Custom;
+    const bool gif = m_recordingDrawerMode == RecordingDrawerMode::Gif;
+    m_recordingCustomGif->setVisible(gif);
+    m_recordingCustomVideo->setVisible(!gif);
+    m_recordingCustomQuality->setVisible(custom);
+    if (m_recordingDrawer && m_recordingDrawer->isVisible())
+        placeRecordingDrawer();
+}
+
+void CaptureOverlay::placeRecordingDrawer()
+{
+    if (!m_recordingDrawer)
+        return;
+    m_recordingDrawer->adjustSize();
+    QRect bounds = m_selectionAnchorScreenRect.intersected(rect());
+    if (bounds.isEmpty())
+        bounds = rect();
+    bounds.adjust(12, 12, -12, -12);
+    m_recordingDrawer->move(recordingDrawerPosition(bounds, m_recordingDrawer->size()));
+}
+
+void CaptureOverlay::openRecordingSettings()
+{
+    const RecordingDrawerMode mode = m_recordingDrawerMode;
+    hideRecordingDrawer(false);
+    hideForModalDialog();
+    // The receiver shows the Settings dialog modally and returns once it
+    // closes; then the drawer comes back with the saved values.
+    emit recordingSettingsRequested();
+    restoreAfterModalDialog();
+    if (m_selectionComplete && mode != RecordingDrawerMode::None)
+        showRecordingDrawer(mode);
+}
+
+void CaptureOverlay::hideRecordingDrawer(bool restoreToolbar)
+{
+    if (m_recordingDrawer)
+        m_recordingDrawer->hide();
+    m_recordingDrawerMode = RecordingDrawerMode::None;
+    if (restoreToolbar && m_selectionComplete) {
+        showToolbar();
+        updateUndoRedoState();
+        update();
+    }
+}
+
+void CaptureOverlay::startRecordingFromDrawer()
+{
+    const RecordingDrawerMode mode = m_recordingDrawerMode;
+    if (mode == RecordingDrawerMode::None || !m_selectionComplete)
+        return;
+    const QRect captureRect = selectedCaptureRect();
+    const QRect displayRect = selectedDisplayRect();
+    hideRecordingDrawer(false);
+    hide();
+    m_selectionComplete = false;
+    m_isSelecting = false;
+    hideToolbar();
+    releaseCaptureBuffers();
+    // The recorder reads FPS, volume and devices straight from QSettings;
+    // write out values the drawer changed within the debounce window.
+    if (m_settingsWriter)
+        m_settingsWriter->flush();
+    if (mode == RecordingDrawerMode::Gif)
+        emit gifCaptureRequested(captureRect, displayRect);
+    else
+        emit videoCaptureRequested(captureRect, displayRect);
+}
+
+void CaptureOverlay::ensureAudioDevicesLoaded()
+{
+    if (!m_audioDevicesLoaded) {
+        m_audioDevicesLoaded = true;
+#ifdef Q_OS_WIN
+        // DirectShow enumeration runs FFmpeg, so it never blocks the GUI
+        // thread: the combos fill from the cache now (when there is one) and
+        // again once the refreshed list arrives.
+        requestDshowAudioDevices(ComponentPaths::ffmpegPath(), this,
+                                 [this](const QList<DshowAudioDevice> &devices) {
+            m_cachedMicrophoneAudioDevices = dshowMicrophoneDevices(devices);
+            populateAudioDeviceCombos();
+        });
+#else
+        m_cachedMicrophoneAudioDevices = microphoneAudioDevices();
+#endif
+    }
+    populateAudioDeviceCombos();
+}
+
+void CaptureOverlay::populateAudioDeviceCombos()
+{
+    QComboBox *combo = m_recordingMicrophoneDeviceCombo;
+    if (!combo)
+        return;
+    QSettings settings("EShot", "EShot");
+    const QString savedMicrophone = settings.value("videoMicrophoneDevice", "default").toString();
+    QSignalBlocker blocker(combo);
+    // "default" follows the system default microphone; the recorder
+    // resolves it when recording starts.
+    if (combo->count() == 0)
+        combo->addItem(TranslationManager::tr("defaultAudioDevice"), QStringLiteral("default"));
+    else
+        combo->setItemData(0, QStringLiteral("default"));
+    for (const auto &device : m_cachedMicrophoneAudioDevices) {
+        const int existing = combo->findData(device.second);
+        if (existing < 0)
+            combo->addItem(device.first, device.second);
+        else if (existing > 0)
+            combo->setItemText(existing, device.first);  // was listed as not connected
+    }
+    // A saved microphone that is gone stays visible as "not connected"
+    // instead of the combo silently showing "Default".
+    if (recordingMicrophoneDeviceMissing(savedMicrophone, m_cachedMicrophoneAudioDevices)
+        && combo->findData(savedMicrophone) < 0) {
+        combo->addItem(TranslationManager::tr("recMicDeviceNotConnected").arg(savedMicrophone),
+                       savedMicrophone);
+    }
+    // The saved device may only have arrived with this list.
+    if (combo->currentIndex() <= 0) {
+        const int saved = combo->findData(savedMicrophone);
+        if (saved > 0)
+            combo->setCurrentIndex(saved);
+    }
+}
+
+void CaptureOverlay::updateToolSettingsDrawerPosition()
+{
+    if (!m_toolSettingsButton || !m_toolSettingsDrawer || !m_selectionComplete)
+        return;
+
+    QRect selRect = normalizedSelectionRect();
+    QRect monitorRect = m_selectionAnchorScreenRect.isValid()
+        ? m_selectionAnchorScreenRect
+        : monitorRectAt(selRect.center());
+    if (monitorRect.isEmpty())
+        monitorRect = rect();
+    monitorRect = monitorRect.intersected(rect());
+    if (monitorRect.isEmpty())
+        monitorRect = rect();
+
+    static_cast<SideTabButton *>(m_toolSettingsButton)
+        ->fitToAvailableHeight(monitorRect.height());
+    m_toolSettingsDrawer->adjustSize();
+    const bool drawerOpen = m_toolSettingsDrawer->isVisible()
+        && !m_toolSettingsDrawer->property("closing").toBool();
+    int bx = drawerOpen
+        ? monitorRect.left() + m_toolSettingsDrawer->width() - 1
+        : monitorRect.left();
+    const int buttonMaxX = qMax(monitorRect.left(), monitorRect.right() + 1 - m_toolSettingsButton->width());
+    const int buttonMaxY = qMax(monitorRect.top() + 32, monitorRect.bottom() - m_toolSettingsButton->height() - 32);
+    bx = qBound(monitorRect.left(), bx, buttonMaxX);
+    int by = qBound(monitorRect.top() + 32,
+                    selRect.center().y() - m_toolSettingsButton->height() / 2,
+                    buttonMaxY);
+    m_toolSettingsButton->move(bx, by);
+    m_toolSettingsButton->show();
+    m_toolSettingsButton->raise();
+
+    if (!m_toolSettingsDrawer->isVisible())
+        return;
+
+    if (m_toolSettingsAnimation && m_toolSettingsAnimation->state() == QAbstractAnimation::Running)
+        return;
+
+    int dx = monitorRect.left();
+    int dy = m_toolSettingsButton->y() - 26;
+    const int drawerMaxY = qMax(monitorRect.top() + 5, monitorRect.bottom() + 1 - m_toolSettingsDrawer->height() - 5);
+    dy = qBound(monitorRect.top() + 5, dy, drawerMaxY);
+    m_toolSettingsDrawer->move(dx, dy);
+    m_toolSettingsDrawer->raise();
+    m_toolSettingsButton->raise();
+}
+
+void CaptureOverlay::updateCounterQuickSettings()
+{
+    if (!m_quickCounterOptions || !m_annotationEngine)
+        return;
+    if (m_quickCounterStartSpin) {
+        QSignalBlocker blocker(m_quickCounterStartSpin);
+        m_quickCounterStartSpin->setValue(m_annotationEngine->counterStartValue());
+    }
+    if (m_quickCounterSizeSlider) {
+        QSignalBlocker blocker(m_quickCounterSizeSlider);
+        const int value = m_annotationEngine->counterDiameter();
+        m_quickCounterSizeSlider->setValue(value);
+        if (m_quickCounterSizeValueLabel)
+            m_quickCounterSizeValueLabel->setText(QString::number(value));
+    }
+    const bool counterActive = m_annotationEngine->currentTool() == AnnotationEngine::Counter;
+    if (m_quickCounterOptions->isHidden() != counterActive)
+        return;
+    m_quickCounterOptions->setVisible(counterActive);
+    // An open drawer grows or shrinks in place for the new tool.
+    if (m_toolSettingsDrawer && m_toolSettingsDrawer->isVisible())
+        updateToolSettingsDrawerPosition();
+}
+
+void CaptureOverlay::setToolSettingsDrawerVisible(bool visible)
+{
+    if (!m_toolSettingsDrawer || !m_toolSettingsButton)
+        return;
+
+    QRect selRect = normalizedSelectionRect();
+    QRect monitorRect = m_selectionAnchorScreenRect.isValid()
+        ? m_selectionAnchorScreenRect
+        : monitorRectAt(selRect.center());
+    if (monitorRect.isEmpty())
+        monitorRect = rect();
+    monitorRect = monitorRect.intersected(rect());
+    if (monitorRect.isEmpty())
+        monitorRect = rect();
+
+    static_cast<SideTabButton *>(m_toolSettingsButton)
+        ->fitToAvailableHeight(monitorRect.height());
+    if (visible)
+        updateCounterQuickSettings();
+    m_toolSettingsDrawer->adjustSize();
+    const int drawerW = m_toolSettingsDrawer->width();
+    const int drawerH = m_toolSettingsDrawer->height();
+    const int drawerVisibleX = monitorRect.left();
+    const int drawerHiddenX = monitorRect.left() - drawerW;
+    const int buttonMaxX = qMax(monitorRect.left(), monitorRect.right() + 1 - m_toolSettingsButton->width());
+    const int buttonMaxY = qMax(monitorRect.top() + 32, monitorRect.bottom() - m_toolSettingsButton->height() - 32);
+    const int drawerMaxY = qMax(monitorRect.top() + 5, monitorRect.bottom() + 1 - drawerH - 5);
+    const int buttonClosedX = qBound(monitorRect.left(), monitorRect.left(), buttonMaxX);
+    const int buttonOpenX = qBound(monitorRect.left(), monitorRect.left() + drawerW - 1, buttonMaxX);
+    const int drawerY = qBound(monitorRect.top() + 5,
+                               m_toolSettingsButton->y() - 26,
+                               drawerMaxY);
+    const int buttonY = qBound(monitorRect.top() + 32,
+                               m_toolSettingsButton->y(),
+                               buttonMaxY);
+
+    if (m_toolSettingsAnimation)
+        m_toolSettingsAnimation->stop();
+    if (m_toolSettingsButtonAnimation)
+        m_toolSettingsButtonAnimation->stop();
+
+    if (visible) {
+        if (m_quickPenWidthSlider && m_annotationEngine) {
+            QSignalBlocker blocker(m_quickPenWidthSlider);
+            const int value = m_annotationEngine->penWidth();
+            m_quickPenWidthSlider->setValue(value);
+            if (m_quickPenWidthValueLabel)
+                m_quickPenWidthValueLabel->setText(QString::number(value));
+        }
+        if (m_quickBlurSlider && m_annotationEngine) {
+            QSignalBlocker blocker(m_quickBlurSlider);
+            const int value = m_annotationEngine->blurIntensity();
+            m_quickBlurSlider->setValue(value);
+            if (m_quickBlurValueLabel)
+                m_quickBlurValueLabel->setText(QString::number(value));
+        }
+        const QRect startRect = m_toolSettingsDrawer->isVisible()
+            ? m_toolSettingsDrawer->geometry()
+            : QRect(drawerHiddenX, drawerY, drawerW, drawerH);
+        const QRect endRect(drawerVisibleX, drawerY, drawerW, drawerH);
+        const QRect buttonStartRect = m_toolSettingsButton->geometry();
+        const QRect buttonEndRect(buttonOpenX, buttonY, m_toolSettingsButton->width(), m_toolSettingsButton->height());
+        m_toolSettingsDrawer->setProperty("closing", false);
+        m_toolSettingsDrawer->setGeometry(startRect);
+        m_toolSettingsDrawer->show();
+        m_toolSettingsDrawer->raise();
+        m_toolSettingsButton->raise();
+        if (m_toolSettingsAnimation) {
+            m_toolSettingsAnimation->setStartValue(startRect);
+            m_toolSettingsAnimation->setEndValue(endRect);
+            m_toolSettingsAnimation->start();
+        } else {
+            m_toolSettingsDrawer->setGeometry(endRect);
+        }
+        if (m_toolSettingsButtonAnimation) {
+            m_toolSettingsButtonAnimation->setStartValue(buttonStartRect);
+            m_toolSettingsButtonAnimation->setEndValue(buttonEndRect);
+            m_toolSettingsButtonAnimation->start();
+        } else {
+            m_toolSettingsButton->setGeometry(buttonEndRect);
+        }
+    } else {
+        if (!m_toolSettingsDrawer->isVisible()) {
+            m_toolSettingsDrawer->hide();
+        } else {
+            const QRect startRect = m_toolSettingsDrawer->geometry();
+            const QRect endRect(drawerHiddenX, startRect.y(), drawerW, drawerH);
+            const QRect buttonStartRect = m_toolSettingsButton->geometry();
+            const QRect buttonEndRect(buttonClosedX, buttonY, m_toolSettingsButton->width(), m_toolSettingsButton->height());
+            m_toolSettingsDrawer->setProperty("closing", true);
+            m_toolSettingsDrawer->raise();
+            m_toolSettingsButton->raise();
+            if (m_toolSettingsAnimation) {
+                m_toolSettingsAnimation->setStartValue(startRect);
+                m_toolSettingsAnimation->setEndValue(endRect);
+                m_toolSettingsAnimation->start();
+            } else {
+                m_toolSettingsDrawer->setGeometry(endRect);
+                m_toolSettingsDrawer->hide();
+                m_toolSettingsDrawer->setProperty("closing", false);
+            }
+            if (m_toolSettingsButtonAnimation) {
+                m_toolSettingsButtonAnimation->setStartValue(buttonStartRect);
+                m_toolSettingsButtonAnimation->setEndValue(buttonEndRect);
+                m_toolSettingsButtonAnimation->start();
+            } else {
+                m_toolSettingsButton->setGeometry(buttonEndRect);
+            }
+        }
+    }
+}
+
+bool CaptureOverlay::isToolSettingsUiAt(const QPoint &pos) const
+{
+    if (m_recordingDrawer && m_recordingDrawer->isVisible()
+        && m_recordingDrawer->geometry().contains(pos))
+        return true;
+    if (m_toolSettingsButton && m_toolSettingsButton->isVisible() &&
+        m_toolSettingsButton->geometry().contains(pos))
+        return true;
+    if (m_toolSettingsDrawer && m_toolSettingsDrawer->isVisible() &&
+        !m_toolSettingsDrawer->property("closing").toBool() &&
+        m_toolSettingsDrawer->geometry().contains(pos))
+        return true;
+    return false;
+}
+
+void CaptureOverlay::refreshUI()
+{
+    // Refresh toolbar button tooltips
+    if (m_toolbar) m_toolbar->refreshToolTips();
+
+    const bool drawerWasVisible = m_toolSettingsDrawer && m_toolSettingsDrawer->isVisible();
+    if (m_toolSettingsAnimation) {
+        m_toolSettingsAnimation->stop();
+        m_toolSettingsAnimation->deleteLater();
+        m_toolSettingsAnimation = nullptr;
+    }
+    if (m_toolSettingsButtonAnimation) {
+        m_toolSettingsButtonAnimation->stop();
+        m_toolSettingsButtonAnimation->deleteLater();
+        m_toolSettingsButtonAnimation = nullptr;
+    }
+    if (m_toolSettingsButton) {
+        m_toolSettingsButton->deleteLater();
+        m_toolSettingsButton = nullptr;
+    }
+    if (m_toolSettingsDrawer) {
+        m_toolSettingsDrawer->deleteLater();
+        m_toolSettingsDrawer = nullptr;
+    }
+    setupToolSettingsDrawer();
+    updateToolSettingsDrawerPosition();
+    if (drawerWasVisible)
+        setToolSettingsDrawerVisible(true);
+
+    // Rebuilt hidden; the Settings link reopens it with the new texts.
+    if (m_recordingDrawer && !m_recordingDrawer->isVisible()) {
+        m_recordingDrawer->deleteLater();
+        m_recordingDrawer = nullptr;
+        setupRecordingDrawer();
+        populateAudioDeviceCombos();
+    }
+
+    // Refresh action panel button tooltips
+    if (m_actionPanel) {
+        QList<QPushButton*> buttons = m_actionPanel->findChildren<QPushButton*>();
+        QStringList tips = {
+            TranslationManager::actionPin(),
+            TranslationManager::actionCopy(),
+            TranslationManager::actionSave(),
+            TranslationManager::actionClose()
+        };
+        for (int i = 0; i < qMin(buttons.size(), tips.size()); ++i) {
+            buttons[i]->setToolTip(tips[i]);
+        }
+    }
+    if (m_helpButton) {
+        m_helpButton->setToolTip(QStringLiteral("<b>%1</b>&nbsp;&nbsp;<span style='color:#a8a8a8'>? / F1</span>")
+                                     .arg(TranslationManager::tr("sheetTitle").toHtmlEscaped()));
+    }
+}
+
+void CaptureOverlay::prewarm()
+{
+    // Force initial paint of overlay + toolbar + action panel at startup
+    // so the first user-triggered capture does not stall on first-render
+    // composition (~2-3 s on Windows for translucent frameless widgets).
+    bool nativeScreenViews = false;
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    nativeScreenViews = LinuxScreenshotPolicy::useNativeScreenViews(
+        qEnvironmentVariable("XDG_CURRENT_DESKTOP"), qEnvironmentVariable("XDG_SESSION_DESKTOP"),
+        qEnvironmentVariable("XDG_SESSION_TYPE"), QGuiApplication::platformName());
+#endif
+    if (!isVisible() && !nativeScreenViews) {
+        setGeometry(-10000, -10000, 800, 220);
+        show();
+        if (m_toolbar) {
+            m_toolbar->adjustSize();
+            m_toolbar->move(20, 20);
+            m_toolbar->show();
+        }
+        if (m_actionPanel) {
+            m_actionPanel->adjustSize();
+            m_actionPanel->move(20, 90);
+            m_actionPanel->show();
+        }
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        if (m_toolbar) m_toolbar->grab();
+        if (m_actionPanel) m_actionPanel->grab();
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        if (m_toolbar) m_toolbar->hide();
+        if (m_actionPanel) m_actionPanel->hide();
+        hide();
+    }
+
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    // GNOME's first Screenshot request may spend seconds activating the portal
+    // service. Warm the service here without performing a screenshot, so the
+    // hotkey remains responsive while keeping the desktop private.
+    LinuxPortalScreenshot::warmup();
+    QSettings settings(QStringLiteral("EShot"), QStringLiteral("EShot"));
+    auto &fastCapture = LinuxFastCapture::instance();
+    // This overlay is prewarmed offscreen; never parent the portal's consent
+    // dialog to it or GNOME can place the picker outside the visible desktop.
+    fastCapture.setEnabled(settings.value(QStringLiteral("fastCaptureEnabled"), false).toBool(), nullptr);
+    fastCapture.prewarm(nullptr);
+#endif
+}
+
+void CaptureOverlay::noteCaptureRequest()
+{
+    m_captureLatencyTimer.start();
+}
+
+void CaptureOverlay::startCapture()
+{
+    startCaptureInternal(CaptureSelectionMode::FreeRegion, false);
+}
+
+void CaptureOverlay::startWindowCapture()
+{
+    startCaptureInternal(CaptureSelectionMode::Window, false);
+}
+
+bool CaptureOverlay::isCaptureActive() const
+{
+    return m_captureInFlight || isVisible()
+        || (m_captureDelayTimer && m_captureDelayTimer->isActive());
+}
+
+void CaptureOverlay::cancelActiveCapture()
+{
+    if (m_captureInFlight)
+        return;
+    if (m_captureDelayTimer && m_captureDelayTimer->isActive()) {
+        m_captureDelayTimer->stop();
+        emit captureCancelled();
+        return;
+    }
+    if (isVisible())
+        cancelCapture();
+}
+
+void CaptureOverlay::captureScreenNow()
+{
+    if (isCaptureActive()) {
+        qInfo() << "[CaptureOverlay] capture-screen-now ignored: a capture is already running";
+        return;
+    }
+#ifdef Q_OS_WIN
+    m_foregroundHwnd = GetForegroundWindow();
+#else
+    m_capturedWindowTitle = LinuxActiveWindowTitle::current();
+#endif
+    m_captureInFlight = true;
+    QPixmap screen = grabScreenUnderCursor();
+    m_captureInFlight = false;
+    if (screen.isNull()) {
+        qCritical() << "[CaptureOverlay] capture-screen-now failed: no screenshot";
+        emit captureFailed(TranslationManager::tr("captureSnapshotFailed"));
+        return;
+    }
+    screen.setDevicePixelRatio(1.0);
+    qInfo() << "[CaptureOverlay] capture-screen-now size=" << screen.size();
+
+    QSettings s(QStringLiteral("EShot"), QStringLiteral("EShot"));
+    const bool copyPathAfterSave = s.value(QStringLiteral("copyPathAfterSave"), false).toBool();
+    if (s.value(QStringLiteral("playSound"), false).toBool()) {
+#ifdef Q_OS_WIN
+        MessageBeep(MB_OK);
+#else
+        QApplication::beep();
+#endif
+    }
+    QString error;
+    if (!saveScreenshotFile(screen, false, &error)) {
+        // Keep the image: it is on the clipboard even if the folder is not writable.
+        QGuiApplication::clipboard()->setPixmap(screen);
+        const QString hint = ProtectedFolderHint::hintForPath(m_lastFailedSavePath);
+        emit captureFailed(hint.isEmpty() ? error : error + QStringLiteral("\n") + hint);
+        return;
+    }
+    // Save already put the path on the clipboard when that option is on.
+    if (!copyPathAfterSave)
+        QGuiApplication::clipboard()->setPixmap(screen);
+}
+
+QPixmap CaptureOverlay::grabScreenUnderCursor()
+{
+    const QPoint cursor = QCursor::pos();
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    // KWin captures one output at its native resolution; no need to grab all.
+    if (LinuxScreenshotPolicy::isKdeWaylandSession(qEnvironmentVariable("XDG_CURRENT_DESKTOP"),
+                                                   qEnvironmentVariable("XDG_SESSION_DESKTOP"),
+                                                   qEnvironmentVariable("XDG_SESSION_TYPE"))) {
+        QScreen *screen = QGuiApplication::screenAt(cursor);
+        if (!screen)
+            screen = QGuiApplication::primaryScreen();
+        if (screen) {
+            QPixmap grab = LinuxPortalScreenshot::grabScreen(screen, this);
+            if (!grab.isNull()) {
+                grab.setDevicePixelRatio(1.0);
+                return grab;
+            }
+        }
+    }
+#endif
+    captureAllScreens();
+    QPixmap result;
+#ifdef Q_OS_WIN
+    POINT nativeCursor = {};
+    if (!m_screenSnapshot.isNull() && GetCursorPos(&nativeCursor)) {
+        MONITORINFO info = {};
+        info.cbSize = sizeof(info);
+        HMONITOR monitor = MonitorFromPoint(nativeCursor, MONITOR_DEFAULTTOPRIMARY);
+        if (monitor && GetMonitorInfoW(monitor, &info)) {
+            const QRect physical(info.rcMonitor.left, info.rcMonitor.top,
+                                 info.rcMonitor.right - info.rcMonitor.left,
+                                 info.rcMonitor.bottom - info.rcMonitor.top);
+            const QRect crop = physical.translated(-m_physicalVirtualDesktopTopLeft)
+                                   .intersected(m_screenSnapshot.rect());
+            if (!crop.isEmpty())
+                result = m_screenSnapshot.copy(crop);
+        }
+    }
+#else
+    if (!m_screenImages.isEmpty()) {
+        for (const CaptureScreenImage &image : std::as_const(m_screenImages)) {
+            if (image.logical.contains(cursor)) {
+                result = QPixmap::fromImage(image.image);
+                break;
+            }
+        }
+        if (result.isNull())
+            result = QPixmap::fromImage(m_screenImages.constFirst().image);
+    } else if (!m_screenSnapshot.isNull()) {
+        QScreen *screen = QGuiApplication::screenAt(cursor);
+        if (!screen)
+            screen = QGuiApplication::primaryScreen();
+        const QRect logical = screen ? screen->geometry().translated(-m_virtualDesktopRect.topLeft())
+                                     : QRect(QPoint(0, 0), m_virtualDesktopRect.size());
+        const QRect crop = snapshotRectFromLogical(logical, m_virtualDesktopRect.size(),
+                                                   m_screenSnapshot.size(), m_dpr)
+                               .intersected(m_screenSnapshot.rect());
+        if (!crop.isEmpty())
+            result = m_screenSnapshot.copy(crop);
+    }
+#endif
+    releaseCaptureBuffers();
+    return result;
+}
+
+void CaptureOverlay::startCaptureInternal(CaptureSelectionMode selectionMode, bool recordingMode)
+{
+    if (m_captureInFlight) {
+        qInfo() << "[CaptureOverlay] capture request ignored: a screenshot is already being taken";
+        return;
+    }
+    releaseCaptureBuffers();
+    ++m_captureGeneration;
+    m_showHighlighterStraightHint = false;
+    if (!m_captureLatencyTimer.isValid())
+        m_captureLatencyTimer.start();
+    m_logNextCapturePaint = true;
+    if (m_captureDelayTimer) m_captureDelayTimer->stop();
+    m_captureMode = recordingMode ? ModeRecording : ModeNormal;
+    m_selectionMode = selectionMode;
+    m_isSelecting = false;
+    m_selectionComplete = false;
+    m_ignoreNextMouseRelease = false;
+    resetGestureState();
+    // A visual search still running for an earlier capture must not reopen
+    // this overlay when it finishes.
+    m_visualSearchOperations.begin();
+    m_selectionLocked = false;
+    m_selectionStart = QPoint();
+    m_selectionEnd = QPoint();
+    m_selectionAnchorScreenRect = QRect();
+    m_windowSnapCandidates.clear();
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    if (m_kwinWindowList)
+        m_kwinWindowList->cancel();
+    m_kdeWindowSnapshot = KWinWindowSnapshot();
+#endif
+    setHoveredWindowRect(QRect());
+    m_pressedWindowRect = QRect();
+    m_windowSnapClickPending = false;
+    m_eyedropperActive = false;
+    m_crosshairPosition = capturePositionFromGlobal(QCursor::pos());
+    m_hasCrosshairPosition = true;
+
+    if (m_textEdit) m_textEdit->hide();
+    if (m_textEditPanel) m_textEditPanel->hide();
+    if (m_textFocusProxy) m_textFocusProxy->hide();
+    m_textJustCommitted = false;
+    // Restores the text style if the last capture ended mid-edit.
+    finishExistingTextEdit();
+    if (m_shortcutSheet)
+        m_shortcutSheet->hide();
+    m_showSelectionHint = false;
+    if (m_annotationEngine) m_annotationEngine->clear();
+    hideToolbar();
+
+    // Save foreground window before overlay (for %T filename variable)
+#ifdef Q_OS_WIN
+    m_foregroundHwnd = GetForegroundWindow();
+#else
+    m_foregroundHwnd = nullptr;
+    m_capturedWindowTitle = LinuxActiveWindowTitle::current();
+#endif
+
+    // Load settings
+    QSettings s("EShot", "EShot");
+    // Overlay shortcuts are re-resolved from settings once per capture
+    m_overlayShortcutCache.clear();
+    const int initialTool = initialAnnotationTool(
+        s.value("rememberLastAnnotationTool", false).toBool(),
+        s.value("lastAnnotationTool", AnnotationEngine::None).toInt(),
+        AnnotationEngine::None);
+    if (m_toolbar) {
+        m_toolbar->refreshTools();
+        m_toolbar->setSelectionLocked(false);
+        m_toolbar->selectTool(initialTool);
+    }
+    if (m_annotationEngine) {
+        m_annotationEngine->setCurrentTool(static_cast<AnnotationEngine::Tool>(initialTool));
+        m_annotationEngine->setSelectedIndex(-1);
+    }
+
+    m_overlayOpacity = s.value("overlayOpacity", 100).toInt();
+    m_crosshairStyle = s.value("crosshairStyle", "dash").toString();
+    m_copyAfterCapture = s.value("copyAfterCapture", true).toBool();
+    m_closeAfterCopy = s.value("closeAfterCopy", true).toBool();
+    m_instantCopyAfterSelection = s.value("instantCopyAfterSelection", false).toBool();
+    m_autoLockSelection = s.value("autoLockSelection", false).toBool();
+    if (m_quickAutoLockSelectionCheck) {
+        const QSignalBlocker blocker(m_quickAutoLockSelectionCheck);
+        m_quickAutoLockSelectionCheck->setChecked(m_autoLockSelection);
+    }
+    m_showCaptureHints = s.value("showCaptureHints", true).toBool();
+
+    // Load blur strength setting
+    int blurIntensity = s.value("blurIntensity", 16).toInt();
+    if (m_annotationEngine) m_annotationEngine->setBlurIntensity(blurIntensity);
+    if (m_quickBlurSlider) m_quickBlurSlider->setValue(blurIntensity);
+    if (m_annotationEngine) {
+        // Counter numbering and sizes carry over between captures, since a
+        // tutorial usually spans several screenshots.
+        m_annotationEngine->setPenWidth(s.value("annotationPenWidth", m_annotationEngine->penWidth()).toInt());
+        m_annotationEngine->setCounterStartValue(s.value("counterStartValue", CounterGeometry::MinStartValue).toInt());
+        m_annotationEngine->setCounterDiameter(s.value("counterSize", CounterGeometry::DefaultDiameter).toInt());
+        m_annotationEngine->setCounterDragDistance(QApplication::startDragDistance());
+    }
+    if (m_quickPenWidthSlider && m_annotationEngine) m_quickPenWidthSlider->setValue(m_annotationEngine->penWidth());
+    setToolSettingsDrawerVisible(false);
+
+    int delayMs = s.value("captureDelay", 0).toInt();
+    if (delayMs > 0)
+        m_captureDelayTimer->start(delayMs);
+    else
+        performCapture();
+}
+
+void CaptureOverlay::startInstantCapture()
+{
+    startCapture();
+    m_instantCopyAfterSelection = true;
+}
+
+void CaptureOverlay::startCaptureForRecording()
+{
+    startCaptureInternal(CaptureSelectionMode::FreeRegion, true);
+    setCursor(Qt::CrossCursor);
+}
+
+void CaptureOverlay::performCapture()
+{
+    if (m_captureInFlight)
+        return;
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    // Ask KWin for the window list first; it is answered while the
+    // screenshot is being taken.
+    requestKdeWindowList();
+#endif
+    m_captureInFlight = true;
+    captureAllScreens();
+    m_captureInFlight = false;
+    if (!LinuxScreenshotPolicy::canPresentCapture(
+            !m_screenSnapshot.isNull() || !m_screenImages.isEmpty())) {
+        qCritical() << "[CaptureOverlay] capture aborted: no usable cursor-free snapshot";
+        cancelCapture();
+        emit captureFailed(TranslationManager::tr("captureSnapshotFailed"));
+        return;
+    }
+
+    // Pass screenshot to annotation engine (for blur effect)
+    if (m_annotationEngine) {
+        m_annotationEngine->setScreenSnapshot(m_screenSnapshot);
+        m_annotationEngine->setSnapshotScale(m_dpr);
+        // A remembered blur/pixelate tool can draw before any tool click.
+        const AnnotationEngine::Tool tool = m_annotationEngine->currentTool();
+        if (tool == AnnotationEngine::Blur || tool == AnnotationEngine::Pixelate)
+            ensureComposedSnapshot();
+    }
+
+#ifdef Q_OS_WIN
+    // Over an exclusive fullscreen game, show without activating; a click on
+    // the overlay or the capture hotkey still works.
+    setAttribute(Qt::WA_ShowWithoutActivating, !m_takeForegroundOnPresent);
+#endif
+    presentCapture();
+    qInfo() << "[CaptureOverlay] window presentation returned after"
+            << m_captureLatencyTimer.elapsed() << "ms";
+
+#ifdef Q_OS_WIN
+    // Keep the overlay above ordinary windows. Windows may restrict focus or
+    // input over elevated windows because EShot runs under the signed-in user.
+    HWND hwnd = reinterpret_cast<HWND>(winId());
+    ::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                       | (m_takeForegroundOnPresent ? 0 : SWP_NOACTIVATE));
+    if (m_takeForegroundOnPresent) {
+        ::SetForegroundWindow(hwnd);
+        ::BringWindowToTop(hwnd);
+    }
+
+    if (m_selectionMode == CaptureSelectionMode::Window) {
+        m_windowSnapCandidates = windowsForCaptureOverlay(
+            reinterpret_cast<quintptr>(hwnd), m_captureMonitors, m_virtualDesktopRect);
+    }
+    setHoveredWindowRect(windowSnapTargetForMode(
+        m_selectionMode, m_windowSnapCandidates, mapFromGlobal(QCursor::pos()), rect()));
+#elif defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    applyKdeWindowList();
+#endif
+    // Native views activate their own output window. All other platforms keep
+    // the original focus order, including Win32's foreground-window handling.
+    if ((!m_screenViews || !m_screenViews->isActive()) && m_takeForegroundOnPresent) {
+        activateWindow();
+        setFocus(Qt::ActiveWindowFocusReason);
+        raise();
+        if (m_textFocusProxy && QWidget::keyboardGrabber() != this)
+            grabKeyboard();
+    }
+    beginCaptureActivation();
+}
+
+void CaptureOverlay::presentCapture()
+{
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    LinuxFastCapture::instance().setOverlayVisible(true);
+    const bool isWayland = QGuiApplication::platformName().contains(
+        QStringLiteral("wayland"), Qt::CaseInsensitive);
+    const bool nativeScreenViews = LinuxScreenshotPolicy::useNativeScreenViews(
+        qEnvironmentVariable("XDG_CURRENT_DESKTOP"), qEnvironmentVariable("XDG_SESSION_DESKTOP"),
+        qEnvironmentVariable("XDG_SESSION_TYPE"), QGuiApplication::platformName());
+    // Once the canvas is embedded in the views it cannot be shown as its own
+    // window again, so a single-output fallback capture also uses the views.
+    if (nativeScreenViews && (!m_screenImages.isEmpty() || m_captureScreen)) {
+        if (!m_screenViews) {
+            m_screenViews = new CaptureScreenViews(this);
+            connect(m_screenViews, &CaptureScreenViews::closeRequested,
+                    this, &CaptureOverlay::cancelCapture);
+        }
+        QScreen *active = QGuiApplication::screenAt(QCursor::pos());
+        if (!active)
+            active = QGuiApplication::primaryScreen();
+        const QList<QScreen *> screens = m_screenImages.isEmpty()
+            ? QList<QScreen *>{m_captureScreen} : QGuiApplication::screens();
+        m_screenViews->present(m_virtualDesktopRect, screens, active);
+        return;
+    } else if (isWayland && m_captureScreen) {
+        winId();
+        if (QWindow *window = windowHandle())
+            window->setScreen(m_captureScreen);
+        setGeometry(m_captureScreen->geometry());
+        showFullScreen();
+    } else {
+        setGeometry(m_virtualDesktopRect);
+        show();
+    }
+#else
+    setGeometry(m_virtualDesktopRect);
+    show();
+#endif
+
+}
+
+void CaptureOverlay::captureAllScreens()
+{
+    m_captureScreen = nullptr;
+    m_screenSnapshot = QPixmap();
+    m_screenImages.clear();
+    m_takeForegroundOnPresent = true;
+#ifdef Q_OS_WIN
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    m_physicalVirtualDesktopTopLeft = QPoint(vx, vy);
+
+    QScreen *primary = QGuiApplication::primaryScreen();
+    m_dpr = primary ? primary->devicePixelRatio() : 1.0;
+
+    QHash<QString, QRect> physicalByName;
+    EnumDisplayMonitors(nullptr, nullptr, collectPhysicalMonitorGeometries,
+                        reinterpret_cast<LPARAM>(&physicalByName));
+    m_captureMonitors.clear();
+    for (QScreen *screen : QGuiApplication::screens()) {
+        const QRect logical = screen->geometry();
+        const qreal scale = screen->devicePixelRatio();
+        QRect physical = physicalByName.value(screen->name());
+        if (!physical.isValid()) {
+            physical = QRect(logical.topLeft(),
+                             QSize(qRound(logical.width() * scale),
+                                   qRound(logical.height() * scale)));
+        }
+        m_captureMonitors.append({logical, physical, scale});
+    }
+
+    if (vw <= 0 || vh <= 0) {
+        if (primary) {
+            m_dpr = primary->devicePixelRatio();
+            m_virtualDesktopRect = primary->geometry();   // logical
+            m_physicalVirtualDesktopTopLeft = QPoint(
+                qRound(m_virtualDesktopRect.x() * m_dpr),
+                qRound(m_virtualDesktopRect.y() * m_dpr));
+            m_screenSnapshot = primary->grabWindow(0);     // physical pixels
+            m_screenSnapshot.setDevicePixelRatio(1.0);
+        }
+        return;
+    }
+
+    // The captured virtual desktop is one contiguous physical bitmap, while
+    // the overlay currently maps it with one canvas transform. Keep that
+    // transform derived from the same primary ratio as the bitmap dimensions.
+    // A union of Qt's mixed-DPI screen geometries has gaps by design and would
+    // stretch this snapshot between monitors. Proper per-monitor rendering is
+    // a separate, piecewise-coordinate change rather than a safe one-line
+    // optimization here.
+    m_virtualDesktopRect = QRect(qRound(vx / m_dpr), qRound(vy / m_dpr),
+                                 qRound(vw / m_dpr), qRound(vh / m_dpr));
+
+    const QRect physicalVirtualDesktop(vx, vy, vw, vh);
+    const WindowsCapturePlan plan = windowsCapturePlan(windowsExclusiveFullscreenRunning());
+    m_takeForegroundOnPresent = plan.takeForeground;
+    QImage image = plan.preferDuplication
+        ? grabWindowsDesktopDuplication(physicalVirtualDesktop)
+        : grabWindowsDesktopGdi(physicalVirtualDesktop);
+    const char *backend = plan.preferDuplication ? "dxgi-duplication" : "gdi";
+    if (image.isNull()) {
+        image = plan.preferDuplication ? grabWindowsDesktopGdi(physicalVirtualDesktop)
+                                       : grabWindowsDesktopDuplication(physicalVirtualDesktop);
+        backend = plan.preferDuplication ? "gdi" : "dxgi-duplication";
+    }
+    if (image.isNull()) {
+        qCritical() << "[CaptureOverlay] Windows desktop capture failed";
+        return;
+    }
+    qInfo() << "[CaptureOverlay] selected capture backend=" << backend
+            << "exclusiveFullscreen=" << plan.preferDuplication;
+    m_screenSnapshot = QPixmap::fromImage(image);
+    m_screenSnapshot.setDevicePixelRatio(1.0);
+#else
+    const QString currentDesktop = qEnvironmentVariable("XDG_CURRENT_DESKTOP");
+    const QString sessionDesktop = qEnvironmentVariable("XDG_SESSION_DESKTOP");
+    const QString sessionType = qEnvironmentVariable("XDG_SESSION_TYPE");
+    const LinuxDesktopEnvironment desktop = LinuxDesktopIntegration::detect(
+        currentDesktop, sessionDesktop);
+    const bool kdeWaylandSession = LinuxScreenshotPolicy::isKdeWaylandSession(
+        currentDesktop, sessionDesktop, sessionType);
+    const bool useXwaylandVirtualOverlay =
+        qEnvironmentVariableIntValue("ESHOT_WAYLAND_XWAYLAND_OVERLAY") == 1
+        && QGuiApplication::platformName().contains(QStringLiteral("xcb"), Qt::CaseInsensitive);
+    if (useXwaylandVirtualOverlay) {
+        QRect logicalRect;
+        QRect physicalRect;
+        m_captureMonitors.clear();
+        for (QScreen *screen : QGuiApplication::screens()) {
+            const QRect logical = screen->geometry();
+            const qreal scale = screen->devicePixelRatio();
+            const QRect physical = physicalRectFromLogical(logical, scale);
+            logicalRect = logicalRect.united(logical);
+            physicalRect = physicalRect.united(physical);
+            m_captureMonitors.append({logical, physical, scale});
+        }
+
+        if (desktop != LinuxDesktopEnvironment::Kde) {
+            FastCaptureFrame fastFrame = LinuxFastCapture::instance().latestFrame();
+            QPixmap portalSnapshot = fastFrame.image.isNull()
+                ? LinuxPortalScreenshot::grab(this)
+                : QPixmap::fromImage(std::move(fastFrame.image));
+            if (!portalSnapshot.isNull()) {
+                portalSnapshot.setDevicePixelRatio(1.0);
+                m_screenSnapshot = portalSnapshot;
+                m_virtualDesktopRect = logicalRect;
+                m_physicalVirtualDesktopTopLeft = physicalRect.topLeft();
+                m_dpr = logicalRect.width() > 0
+                    ? portalSnapshot.width() / static_cast<qreal>(logicalRect.width())
+                    : 1.0;
+                qInfo() << "[CaptureOverlay] selected capture backend="
+                        << (fastFrame.capturedAtMs > 0 ? "screencast-latest-workspace" : "portal-workspace")
+                        << "desktop=" << LinuxDesktopIntegration::displayName(desktop);
+            } else {
+                qCritical() << "[CaptureOverlay] portal workspace capture failed for"
+                            << LinuxDesktopIntegration::displayName(desktop);
+            }
+            return;
+        }
+
+        // CaptureWorkspace renders every output at the maximum desktop scale.
+        // That interpolates a 100% output when a 200% output is also connected.
+        // CaptureScreen preserves each output's native pixels and supplies its
+        // true scale, unlike QScreen's all-1 DPRs under XWayland.
+        if (kdeWaylandSession && captureNativeScreenImages(logicalRect, physicalRect))
+            return;
+
+        qWarning() << "[CaptureOverlay] native per-screen capture failed;"
+                      " falling back to workspace capture";
+        QPixmap workspaceSnapshot = LinuxPortalScreenshot::grabWorkspace(this);
+        if (!workspaceSnapshot.isNull()) {
+            workspaceSnapshot.setDevicePixelRatio(1.0);
+            m_screenSnapshot = workspaceSnapshot;
+            m_virtualDesktopRect = logicalRect;
+            m_physicalVirtualDesktopTopLeft = physicalRect.topLeft();
+            m_dpr = logicalRect.width() > 0
+                ? workspaceSnapshot.width() / static_cast<qreal>(logicalRect.width()) : 1.0;
+            return;
+        }
+
+        QPixmap spectacleSnapshot = LinuxPortalScreenshot::grabSpectacleWorkspace(this);
+        if (!spectacleSnapshot.isNull()) {
+            spectacleSnapshot.setDevicePixelRatio(1.0);
+            m_screenSnapshot = spectacleSnapshot;
+            m_virtualDesktopRect = logicalRect;
+            m_physicalVirtualDesktopTopLeft = physicalRect.topLeft();
+            m_dpr = logicalRect.width() > 0
+                ? spectacleSnapshot.width() / static_cast<qreal>(logicalRect.width()) : 1.0;
+            qInfo() << "[CaptureOverlay] selected capture backend=spectacle-workspace";
+            return;
+        }
+
+        if (!LinuxScreenshotPolicy::allowCursorBearingFallback(kdeWaylandSession)) {
+            m_screenSnapshot = QPixmap();
+            qCritical() << "[CaptureOverlay] no cursor-free screenshot backend is available;"
+                           " refusing KDE Wayland portal/QScreen fallback";
+            return;
+        }
+
+        QPixmap kwinSnapshot(physicalRect.size());
+        kwinSnapshot.setDevicePixelRatio(1.0);
+        kwinSnapshot.fill(Qt::black);
+        QPainter kwinPainter(&kwinSnapshot);
+        bool capturedAllScreens = !m_captureMonitors.isEmpty();
+        for (QScreen *screen : QGuiApplication::screens()) {
+            QPixmap screenGrab = LinuxPortalScreenshot::grabScreen(screen, this);
+            if (screenGrab.isNull()) {
+                capturedAllScreens = false;
+                break;
+            }
+            const QRect destination = physicalRectFromLogical(screen->geometry(), screen->devicePixelRatio())
+                                          .translated(-physicalRect.topLeft());
+            kwinPainter.drawPixmap(destination, screenGrab, screenGrab.rect());
+        }
+        kwinPainter.end();
+        if (capturedAllScreens) {
+            m_screenSnapshot = kwinSnapshot;
+            m_virtualDesktopRect = logicalRect;
+            m_physicalVirtualDesktopTopLeft = physicalRect.topLeft();
+            m_dpr = logicalRect.width() > 0
+                ? kwinSnapshot.width() / static_cast<qreal>(logicalRect.width())
+                : 1.0;
+            return;
+        }
+
+        QPixmap portalSnapshot = LinuxPortalScreenshot::grab(this);
+        if (!portalSnapshot.isNull()) {
+            portalSnapshot.setDevicePixelRatio(1.0);
+            m_screenSnapshot = portalSnapshot;
+            m_virtualDesktopRect = logicalRect;
+            m_physicalVirtualDesktopTopLeft = physicalRect.topLeft();
+            m_dpr = logicalRect.width() > 0
+                ? portalSnapshot.width() / static_cast<qreal>(logicalRect.width())
+                : 1.0;
+            return;
+        }
+    }
+
+    const bool isWayland = QGuiApplication::platformName().contains(QStringLiteral("wayland"), Qt::CaseInsensitive);
+    if (isWayland) {
+        if (kdeWaylandSession) {
+            QRect logicalRect;
+            QRect physicalRect;
+            m_captureMonitors.clear();
+            for (QScreen *screen : QGuiApplication::screens()) {
+                const QRect logical = screen->geometry();
+                const qreal scale = screen->devicePixelRatio();
+                const QRect physical = physicalRectFromLogical(logical, scale);
+                logicalRect = logicalRect.united(logical);
+                physicalRect = physicalRect.united(physical);
+                m_captureMonitors.append({logical, physical, scale});
+            }
+            if (captureNativeScreenImages(logicalRect, physicalRect))
+                return;
+        }
+        QScreen *screen = QGuiApplication::screenAt(QCursor::pos());
+        if (!screen)
+            screen = QGuiApplication::primaryScreen();
+        if (!screen)
+            return;
+        m_captureScreen = screen;
+
+        const QRect logical = screen->geometry();
+        const qreal scale = screen->devicePixelRatio();
+        const QRect physical = physicalRectFromLogical(logical, scale);
+        m_dpr = scale;
+        m_virtualDesktopRect = logical;
+        m_physicalVirtualDesktopTopLeft = physical.topLeft();
+        m_captureMonitors = {{logical, physical, scale}};
+
+        if (desktop != LinuxDesktopEnvironment::Kde) {
+            FastCaptureFrame fastFrame = LinuxFastCapture::instance().latestFrame();
+            if (!fastFrame.image.isNull()) {
+                m_screenSnapshot = QPixmap::fromImage(std::move(fastFrame.image));
+                m_screenSnapshot.setDevicePixelRatio(1.0);
+                qInfo() << "[CaptureOverlay] selected capture backend=screencast-latest-screen desktop="
+                        << LinuxDesktopIntegration::displayName(desktop);
+                return;
+            }
+            QPixmap portalSnapshot = LinuxPortalScreenshot::grab(this);
+            if (!portalSnapshot.isNull()) {
+                QRect virtualPhysical;
+                for (QScreen *candidate : QGuiApplication::screens()) {
+                    virtualPhysical = virtualPhysical.united(
+                        physicalRectFromLogical(candidate->geometry(),
+                                                candidate->devicePixelRatio()));
+                }
+                const QRect crop = portalCropRect(physical, virtualPhysical);
+                if (portalSnapshot.rect().contains(crop))
+                    portalSnapshot = portalSnapshot.copy(crop);
+                portalSnapshot.setDevicePixelRatio(1.0);
+                m_screenSnapshot = portalSnapshot;
+                qInfo() << "[CaptureOverlay] selected capture backend=portal-screen desktop="
+                        << LinuxDesktopIntegration::displayName(desktop);
+            }
+            return;
+        }
+
+        m_screenSnapshot = LinuxPortalScreenshot::grabScreen(screen, this);
+        m_screenSnapshot.setDevicePixelRatio(1.0);
+        if (!m_screenSnapshot.isNull()) {
+            qInfo() << "[CaptureOverlay] selected capture backend=kwin-screen";
+            return;
+        }
+
+        QPixmap spectacleSnapshot = LinuxPortalScreenshot::grabSpectacleWorkspace(this);
+        if (!spectacleSnapshot.isNull()) {
+            QRect virtualPhysical;
+            for (QScreen *candidate : QGuiApplication::screens())
+                virtualPhysical = virtualPhysical.united(
+                    physicalRectFromLogical(candidate->geometry(), candidate->devicePixelRatio()));
+            const QRect crop = portalCropRect(physical, virtualPhysical);
+            if (spectacleSnapshot.rect().contains(crop))
+                spectacleSnapshot = spectacleSnapshot.copy(crop);
+            spectacleSnapshot.setDevicePixelRatio(1.0);
+            m_screenSnapshot = spectacleSnapshot;
+            qInfo() << "[CaptureOverlay] selected capture backend=spectacle-screen-crop";
+            return;
+        }
+
+        if (!LinuxScreenshotPolicy::allowCursorBearingFallback(kdeWaylandSession)) {
+            m_screenSnapshot = QPixmap();
+            qCritical() << "[CaptureOverlay] no cursor-free screenshot backend is available;"
+                           " refusing KDE Wayland portal/QScreen fallback";
+            return;
+        }
+
+        QPixmap portalSnapshot = LinuxPortalScreenshot::grab(this);
+        if (!portalSnapshot.isNull()) {
+            QRect virtualPhysical;
+            for (QScreen *candidate : QGuiApplication::screens())
+                virtualPhysical = virtualPhysical.united(
+                    physicalRectFromLogical(candidate->geometry(), candidate->devicePixelRatio()));
+            const QRect crop = portalCropRect(physical, virtualPhysical);
+            if (portalSnapshot.rect().contains(crop))
+                portalSnapshot = portalSnapshot.copy(crop);
+            portalSnapshot.setDevicePixelRatio(1.0);
+            m_screenSnapshot = portalSnapshot;
+        }
+        return;
+    }
+
+    QRect logicalRect;
+    QRect physicalRect;
+    auto screens = QGuiApplication::screens();
+    m_dpr = QGuiApplication::primaryScreen() ? QGuiApplication::primaryScreen()->devicePixelRatio() : 1.0;
+    for (auto *s : screens) {
+        auto g = s->geometry();
+        const qreal d = s->devicePixelRatio();
+        logicalRect = logicalRect.united(g);
+        physicalRect = physicalRect.united(QRect(qRound(g.x() * d),
+                                                 qRound(g.y() * d),
+                                                 qRound(g.width() * d),
+                                                 qRound(g.height() * d)));
+    }
+    m_virtualDesktopRect = logicalRect;
+    m_physicalVirtualDesktopTopLeft = physicalRect.topLeft();
+    m_screenSnapshot = QPixmap(physicalRect.size());
+    m_screenSnapshot.setDevicePixelRatio(1.0);
+    m_screenSnapshot.fill(Qt::black);
+    QPainter p(&m_screenSnapshot);
+    bool grabbedAnyScreen = false;
+    for (auto *s : screens) {
+        auto grab = s->grabWindow(0);
+        if (grab.isNull())
+            continue;
+        grabbedAnyScreen = true;
+        auto g = s->geometry();
+        const qreal d = s->devicePixelRatio();
+        p.drawPixmap(qRound(g.x() * d) - physicalRect.x(),
+                     qRound(g.y() * d) - physicalRect.y(),
+                     grab);
+    }
+    p.end();
+    if (!grabbedAnyScreen || m_screenSnapshot.isNull()) {
+        QPixmap portalSnapshot = LinuxPortalScreenshot::grab(this);
+        if (!portalSnapshot.isNull()) {
+            portalSnapshot.setDevicePixelRatio(1.0);
+            m_screenSnapshot = portalSnapshot;
+            m_virtualDesktopRect = QRect(QPoint(0, 0), portalSnapshot.size());
+            m_physicalVirtualDesktopTopLeft = QPoint(0, 0);
+            m_dpr = 1.0;
+        }
+    }
+#endif
+}
+
+bool CaptureOverlay::captureNativeScreenImages(const QRect &logicalRect, const QRect &physicalRect)
+{
+    QVector<CaptureScreenImage> images;
+    for (QScreen *screen : QGuiApplication::screens()) {
+        const QPixmap grab = LinuxPortalScreenshot::grabScreen(screen, this);
+        if (grab.isNull())
+            return false;
+        QImage image = grab.toImage();
+        image.setDevicePixelRatio(1.0);
+        images.append({screen->geometry(), image, grab.devicePixelRatio()});
+    }
+    if (images.isEmpty() || captureSelectionSize(images, logicalRect).isEmpty())
+        return false;
+    // The composed canvas (at the highest output scale) is not kept here: it
+    // doubles the memory of a capture and only redaction and the eyedropper
+    // need it (ensureComposedSnapshot).
+    m_screenImages = images;
+    m_screenSnapshot = QPixmap();
+    m_virtualDesktopRect = logicalRect;
+    m_physicalVirtualDesktopTopLeft = physicalRect.topLeft();
+    m_dpr = captureSelectionScale(images, logicalRect);
+    qInfo() << "[CaptureOverlay] selected capture backend=kwin-per-screen"
+            << "canvas=" << captureSelectionSize(images, logicalRect) << "scale=" << m_dpr;
+    return true;
+}
+
+void CaptureOverlay::ensureComposedSnapshot()
+{
+    if (!m_screenSnapshot.isNull() || m_screenImages.isEmpty())
+        return;
+    const QImage canvas = composeCaptureImages(m_screenImages, m_virtualDesktopRect);
+    if (canvas.isNull())
+        return;
+    m_screenSnapshot = QPixmap::fromImage(canvas);
+    m_screenSnapshot.setDevicePixelRatio(1.0);
+    if (m_annotationEngine) {
+        m_annotationEngine->setScreenSnapshot(m_screenSnapshot);
+        m_annotationEngine->setSnapshotScale(m_dpr);
+    }
+    qInfo() << "[CaptureOverlay] composed full snapshot on demand:" << canvas.size();
+}
+
+QPoint CaptureOverlay::capturePositionFromGlobal(const QPoint &point) const
+{
+    if (m_screenViews)
+        return point - m_virtualDesktopRect.topLeft();
+    return mapFromGlobal(point);
+}
+
+void CaptureOverlay::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event);
+    QPainter painter(this);
+    const qreal paintScale = m_screenViews && m_screenViews->isActive()
+        ? qAbs(painter.deviceTransform().m11()) : painter.device()->devicePixelRatioF();
+    const bool snapshotOneToOne =
+        m_screenSnapshot.size() == (QSizeF(width(), height()) * paintScale).toSize();
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, !snapshotOneToOne);
+
+    if (m_screenImages.isEmpty())
+        painter.drawPixmap(0, 0, width(), height(), m_screenSnapshot);
+    else {
+        painter.fillRect(rect(), Qt::black);
+        paintCaptureImages(&painter, m_screenImages, m_virtualDesktopRect.topLeft());
+    }
+    // Draw once beneath the dim layer so annotations outside the selection
+    // remain visible with the same darkening as the desktop background.
+    if (m_annotationEngine && m_selectionComplete)
+        m_annotationEngine->render(&painter, QPoint());
+    painter.fillRect(rect(), QColor(0, 0, 0, m_overlayOpacity));
+
+    const bool windowPreview = !m_isSelecting && !m_selectionComplete
+        && !m_hoveredWindowRect.isEmpty();
+    QRect selRect = windowPreview
+        ? (m_animatedWindowRect.isValid() ? m_animatedWindowRect : m_hoveredWindowRect)
+        : normalizedSelectionRect();
+
+    if (!selRect.isEmpty() && selRect != rect()) {
+        // Clean area. When the selection covers the whole overlay the base
+        // blit above already painted it; skip the redundant second blit.
+        painter.save();
+        painter.setClipRect(selRect);
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        // Keep the preview aligned to the full canvas. Cropping and rescaling
+        // the selection itself causes subpixel shimmer at fractional DPI.
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, !snapshotOneToOne);
+        if (m_screenImages.isEmpty())
+            painter.drawPixmap(rect(), m_screenSnapshot, m_screenSnapshot.rect());
+        else
+            paintCaptureImages(&painter, m_screenImages, m_virtualDesktopRect.topLeft());
+        painter.restore();
+
+        // Annotation
+        if (m_annotationEngine && m_selectionComplete) {
+            painter.setClipRect(selRect);
+            m_annotationEngine->render(&painter, QPoint());
+            if (m_annotationEngine->selectedIndex() >= 0) {
+                const int selectedIndex = m_annotationEngine->selectedIndex();
+                QRect annotationRect = m_annotationEngine->boundingRectOf(selectedIndex)
+                                           .adjusted(-4, -4, 4, 4);
+                if (!annotationRect.isEmpty()) {
+                    QPen selectPen(QColor(179, 102, 255, 235), 1, Qt::DashLine);
+                    selectPen.setCosmetic(true);
+                    painter.setPen(selectPen);
+                    painter.setBrush(Qt::NoBrush);
+                    painter.drawRoundedRect(annotationRect.adjusted(0, 0, -1, -1), 3, 3);
+
+                    if (m_annotationEngine->isTextAnnotation(selectedIndex)) {
+                        constexpr int handleRadius = 5;
+                        const QList<QPoint> handles = {
+                            annotationRect.topLeft(), annotationRect.topRight(),
+                            annotationRect.bottomLeft(), annotationRect.bottomRight()
+                        };
+                        painter.setPen(QPen(QColor(179, 102, 255), 1));
+                        painter.setBrush(QColor(250, 250, 252));
+                        for (const QPoint &handle : handles) {
+                            painter.drawRect(QRect(handle - QPoint(handleRadius, handleRadius),
+                                                   QSize(handleRadius * 2, handleRadius * 2)));
+                        }
+                    }
+
+                    if (m_annotationEngine->isRotatable(selectedIndex)) {
+                        const QPointF handleCenter = AnnotationRotationGeometry::handleCenter(annotationRect);
+                        const QPointF connectorStart(annotationRect.center().x(), annotationRect.bottom());
+                        painter.drawLine(connectorStart, handleCenter);
+                        const QRectF handleRect(handleCenter.x() - 12, handleCenter.y() - 12, 24, 24);
+                        painter.setBrush(QColor(250, 250, 252));
+                        painter.setPen(QPen(QColor(179, 102, 255), 1));
+                        painter.drawEllipse(handleRect);
+                        QFont handleFont = painter.font();
+                        handleFont.setPointSize(13);
+                        handleFont.setBold(true);
+                        painter.setFont(handleFont);
+                        painter.setPen(QColor(58, 34, 84));
+                        painter.drawText(handleRect, Qt::AlignCenter, QString::fromUtf8("↻"));
+                    }
+                }
+            }
+            painter.setClipping(false);
+        }
+
+    // Frame
+    const qreal devicePixelRatio = paintScale;
+    const SelectionFrameSegments frameSegments = selectionFrameSegments(selRect, devicePixelRatio);
+    painter.save();
+    painter.setClipRegion(selectionFrameClipRegion(selRect, rect()));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(0, 120, 215));
+    painter.drawRect(frameSegments.top);
+    painter.drawRect(frameSegments.right);
+    painter.drawRect(frameSegments.bottom);
+    painter.drawRect(frameSegments.left);
+    painter.restore();
+
+    // Corner handles
+        int hs = 5; // Handle size radius
+        QColor hc(255, 255, 255);
+        
+        auto drawHandle = [&](const QPointF &p) {
+            const QRectF hr(p - QPointF(hs, hs), QSizeF(hs * 2, hs * 2));
+            painter.fillRect(hr, hc);
+        };
+        auto drawEdgeHandle = [&](const QPointF &p, bool horizontal) {
+            const QSize size = horizontal ? QSize(10, 4) : QSize(4, 10);
+            const QRectF hr(p - QPointF(size.width() / 2.0, size.height() / 2.0), size);
+            painter.fillRect(hr, hc);
+        };
+
+        if (!windowPreview) {
+            drawHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::TopLeft,
+                                                   devicePixelRatio));
+            drawHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::TopRight,
+                                                   devicePixelRatio));
+            drawHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::BottomLeft,
+                                                   devicePixelRatio));
+            drawHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::BottomRight,
+                                                   devicePixelRatio));
+            drawEdgeHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::Top,
+                                                       devicePixelRatio), true);
+            drawEdgeHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::Right,
+                                                       devicePixelRatio), false);
+            drawEdgeHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::Bottom,
+                                                       devicePixelRatio), true);
+            drawEdgeHandle(selectionFrameHandleCenter(selRect, SelectionResizeHandle::Left,
+                                                       devicePixelRatio), false);
+        }
+
+        // Size info — always visible (top-left of selection)
+        if (m_isSelecting || m_selectionComplete) {
+            const QSize pixelSize = m_screenImages.isEmpty()
+                ? logicalToSnapshot(selRect).size()
+                : captureSelectionSize(m_screenImages,
+                                       selRect.translated(m_virtualDesktopRect.topLeft()));
+            QString dim = QString("%1 x %2").arg(pixelSize.width()).arg(pixelSize.height());
+            QFont f = painter.font(); f.setPointSize(10); f.setBold(true);
+            painter.setFont(f);
+            QFontMetrics fm(f);
+            int tw = fm.horizontalAdvance(dim) + 16;
+            int th = fm.height() + 8;
+            int lx = selRect.left();
+            int ly = selRect.top() - th - 4;
+            if (ly < 4)
+                ly = selRect.top() + 4;
+            if (lx + tw > width() - 4)
+                lx = width() - tw - 4;
+            if (lx < 4)
+                lx = 4;
+
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(0,0,0,180));
+            painter.drawRoundedRect(lx, ly, tw, th, 4, 4);
+            painter.setPen(Qt::white);
+            painter.drawText(lx + 8, ly + fm.ascent() + 4, dim);
+        }
+    }
+
+    // Crosshair
+    if (!m_isSelecting && !m_selectionComplete && m_hoveredWindowRect.isEmpty()
+        && m_crosshairStyle != "none" && !m_eyedropperActive) {
+        const QPoint cur = m_hasCrosshairPosition
+            ? m_crosshairPosition : capturePositionFromGlobal(QCursor::pos());
+        QPen cp;
+        cp.setColor(QColor(255,255,255,150));
+        cp.setWidth(1);
+        if (m_crosshairStyle == "dash")
+            cp.setStyle(Qt::DashLine);
+        else
+            cp.setStyle(Qt::SolidLine);
+        painter.setPen(cp);
+        painter.drawLine(cur.x(), 0, cur.x(), height());
+        painter.drawLine(0, cur.y(), width(), cur.y());
+    }
+
+    if (!isShortcutSheetOpen()
+        && shouldShowCaptureHints(m_showCaptureHints, m_isSelecting,
+                                  m_selectionComplete, m_eyedropperActive)) {
+        const QPoint cursorPos = capturePositionFromGlobal(QCursor::pos());
+        drawCaptureHints(painter, monitorRectAt(cursorPos), m_captureMode == ModeRecording);
+    }
+
+    if (m_showSelectionHint && m_selectionComplete && !isShortcutSheetOpen())
+        drawSelectionHint(painter);
+
+    if (m_showHighlighterStraightHint && m_selectionComplete) {
+        const QString hint = TranslationManager::tr("highlighterStraightHint");
+        QFont hintFont = painter.font();
+        hintFont.setPointSize(10);
+        hintFont.setWeight(QFont::DemiBold);
+        painter.setFont(hintFont);
+        const QFontMetrics metrics(hintFont);
+        const int hintWidth = metrics.horizontalAdvance(hint) + 28;
+        const int hintHeight = metrics.height() + 16;
+        const QRect selection = normalizedSelectionRect();
+        const QRect hintRect(selection.center().x() - hintWidth / 2,
+                             qMax(selection.top() + 12, selection.bottom() - hintHeight - 18),
+                             hintWidth, hintHeight);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(31, 32, 35, 235));
+        painter.drawRoundedRect(hintRect, 8, 8);
+        painter.setPen(QColor(239, 241, 245));
+        painter.drawText(hintRect, Qt::AlignCenter, hint);
+    }
+
+    // Eyedropper: color preview circle
+    if (m_eyedropperActive) {
+        QPoint cur = capturePositionFromGlobal(QCursor::pos());
+        if (rect().contains(cur)) {
+            QColor pixelColor;
+            const QPoint curDev = logicalToSnapshot(cur);
+            if (m_eyedropperImage.rect().contains(curDev))
+                pixelColor = QColor(m_eyedropperImage.pixel(curDev));
+            if (pixelColor.isValid()) {
+                // Circle
+                painter.setPen(QPen(Qt::white, 2));
+                painter.setBrush(pixelColor);
+                painter.drawEllipse(cur, 12, 12);
+                // Color code label
+                QString colorName = pixelColor.name().toUpper();
+                QFont f = painter.font(); f.setPointSize(9); f.setBold(true);
+                painter.setFont(f);
+                QFontMetrics fm(f);
+                int tw = fm.horizontalAdvance(colorName) + 12;
+                int th = fm.height() + 6;
+                int lx = cur.x() + 18;
+                int ly = cur.y() + 18;
+                if (lx + tw > width() - 5) lx = cur.x() - tw - 18;
+                if (ly + th > height() - 5) ly = cur.y() - th - 18;
+                painter.setPen(Qt::NoPen);
+                painter.setBrush(QColor(0,0,0,200));
+                painter.drawRoundedRect(lx, ly, tw, th, 4, 4);
+                painter.setPen(Qt::white);
+                painter.drawText(lx + 6, ly + fm.ascent() + 3, colorName);
+            }
+        }
+    }
+
+    if (m_showInputBlockedBanner && !m_selectionComplete && !isShortcutSheetOpen()) {
+        drawInputBlockedBanner(painter, monitorRectAt(capturePositionFromGlobal(QCursor::pos())),
+                               inputBlockedBannerText());
+    }
+
+    if (m_logNextCapturePaint) {
+        m_logNextCapturePaint = false;
+        qInfo() << "[CaptureOverlay] first frame painted after"
+                << m_captureLatencyTimer.elapsed() << "ms";
+    }
+}
+
+void CaptureOverlay::mousePressEvent(QMouseEvent *event)
+{
+    if (m_captureLatencyTimer.isValid()) {
+        qInfo() << "[CaptureOverlay] first pointer press accepted after"
+                << m_captureLatencyTimer.elapsed() << "ms";
+    }
+    noteCaptureInput();
+    if (event->button() == Qt::LeftButton) {
+        const bool recordingOpen = m_recordingDrawer && m_recordingDrawer->isVisible();
+        const bool quickSettingsOpen = m_toolSettingsDrawer
+            && m_toolSettingsDrawer->isVisible()
+            && !m_toolSettingsDrawer->property("closing").toBool();
+        const bool pressInsideMenu = isToolSettingsUiAt(event->pos());
+        const OverlayMenuPressAction menuPressAction = overlayMenuPressAction(
+            recordingOpen, quickSettingsOpen, pressInsideMenu);
+        if (menuPressAction == OverlayMenuPressAction::CloseAndConsume
+            || menuPressAction == OverlayMenuPressAction::CloseAndContinueCapture) {
+            if (recordingOpen)
+                hideRecordingDrawer();
+            if (quickSettingsOpen)
+                setToolSettingsDrawerVisible(false);
+        }
+        if (menuPressAction == OverlayMenuPressAction::CloseAndConsume
+            || menuPressAction == OverlayMenuPressAction::ConsumeInsideMenu) {
+            event->accept();
+            return;
+        }
+        if (m_toolbar && m_toolbar->isVisible() && m_toolbar->geometry().contains(event->pos()))
+            return;
+        if (m_actionPanel && m_actionPanel->isVisible() && m_actionPanel->geometry().contains(event->pos()))
+            return;
+
+        // Eyedropper click — pick color and return to normal mode
+        if (m_eyedropperActive) {
+            const QPoint pickDev = logicalToSnapshot(event->pos());
+            if (m_eyedropperImage.rect().contains(pickDev)) {
+                QColor c = QColor(m_eyedropperImage.pixel(pickDev));
+                if (c.isValid()) {
+                    if (m_annotationEngine) m_annotationEngine->setColor(c);
+                    // Update color button in toolbar
+                    if (m_toolbar) m_toolbar->setColor(c);
+                }
+            }
+            m_eyedropperActive = false;
+            m_eyedropperImage = QImage();
+            setCursor(Qt::CrossCursor);
+            update();
+            return;
+        }
+
+        if (m_selectionComplete && m_annotationEngine
+            && m_annotationEngine->selectedIndex() >= 0) {
+            const int selectedIndex = m_annotationEngine->selectedIndex();
+            if (m_annotationEngine->isTextAnnotation(selectedIndex)) {
+                const QRect annotationRect = m_annotationEngine->boundingRectOf(selectedIndex)
+                                                 .adjusted(-4, -4, 4, 4);
+                const QList<QPair<QPoint, TextResizeHandle>> handles = {
+                    {annotationRect.topLeft(), TextResizeTopLeft},
+                    {annotationRect.topRight(), TextResizeTopRight},
+                    {annotationRect.bottomLeft(), TextResizeBottomLeft},
+                    {annotationRect.bottomRight(), TextResizeBottomRight}
+                };
+                for (const auto &handle : handles) {
+                    if (QLineF(event->pos(), handle.first).length() <= 9.0) {
+                        m_isResizingTextAnnotation = true;
+                        m_textResizeHandle = handle.second;
+                        m_textResizeDragStart = event->pos();
+                        m_textResizeStartBounds = m_annotationEngine->rotatedBoundingRectOf(selectedIndex);
+                        m_annotationEngine->beginTextResize(selectedIndex);
+                        setCursor((handle.second == TextResizeTopRight
+                                   || handle.second == TextResizeBottomLeft)
+                                      ? Qt::SizeBDiagCursor : Qt::SizeFDiagCursor);
+                        event->accept();
+                        return;
+                    }
+                }
+            }
+            if (m_annotationEngine->isRotatable(selectedIndex)) {
+                const QRect annotationRect = m_annotationEngine->boundingRectOf(selectedIndex)
+                                                 .adjusted(-4, -4, 4, 4);
+                const QPointF handleCenter = AnnotationRotationGeometry::handleCenter(annotationRect);
+                if (QLineF(event->pos(), handleCenter).length() <= 14.0) {
+                    m_isRotatingAnnotation = true;
+                    m_annotationEngine->beginRotate(selectedIndex);
+                    m_rotationCenter = m_annotationEngine->rotatedBoundingRectOf(selectedIndex).center();
+                    m_rotationDragStartAngle = AnnotationRotationGeometry::angleAt(m_rotationCenter, event->pos());
+                    m_rotationStartDegrees = m_annotationEngine->rotationDegreesOf(selectedIndex);
+                    setCursor(Qt::CrossCursor);
+                    event->accept();
+                    return;
+                }
+            }
+        }
+
+        if (m_selectionComplete && !m_selectionLocked) {
+            QRect selRect = normalizedSelectionRect();
+
+            ResizeMode mode = getResizeMode(event->pos());
+            const bool selectionHandleHit = mode != ResNone && mode != ResMove && mode != ResNewSelection;
+            if (m_annotationEngine && shouldReleaseToolForResize(selectionHandleHit,
+                    m_annotationEngine->currentTool(), AnnotationEngine::None)) {
+                // Temporary release for the resize; not a remembered choice.
+                m_annotationEngine->setCurrentTool(AnnotationEngine::None);
+                m_annotationEngine->setSelectedIndex(-1);
+                if (m_toolbar)
+                    m_toolbar->selectTool(AnnotationEngine::None);
+            }
+            
+            bool isDrawingTool = (m_annotationEngine && m_annotationEngine->currentTool() != AnnotationEngine::None);
+            if (isDrawingTool && selRect.contains(event->pos())) {
+                QPoint rel = event->pos();
+                if (m_annotationEngine->currentTool() == AnnotationEngine::Eraser) {
+                    if (m_annotationEngine->eraseAnnotationAt(rel)) {
+                        update();
+                        updateUndoRedoState();
+                    }
+                } else {
+                    if (handleAnnotationPress(rel, event->modifiers()))
+                        return;
+                    m_annotationEngine->setSelectedIndex(-1);
+                    m_annotationEngine->beginDraw(rel);
+                    update();
+                }
+                return;
+            }
+
+            // Annotation click while no tool is selected → move mode
+            if (!isDrawingTool && !selectionHandleHit && m_annotationEngine && selRect.contains(event->pos())) {
+                const int idx = m_annotationEngine->findAnnotationAt(event->pos());
+                if (idx >= 0) {
+                    startAnnotationMove(idx, event->pos());
+                    return;
+                }
+            }
+
+            if (mode != ResNone && mode != ResNewSelection) {
+                m_resizeMode = mode;
+                if (mode == ResMove) {
+                    m_moveOffset = event->pos() - selRect.topLeft();
+                } else {
+                    m_selectionStart = selRect.topLeft();
+                    m_selectionEnd = selRect.bottomRight();
+                }
+                update();
+                return;
+            }
+            
+            if (selRect.contains(event->pos())) {
+                // Click in selection area — move current selection
+            } else {
+                m_selectionComplete = false;
+                m_isSelecting = true;
+                m_resizeMode = ResNewSelection;
+                m_selectionStart = event->pos();
+                m_selectionEnd = event->pos();
+                m_selectionAnchorScreenRect = monitorRectAt(event->pos());
+                // A new selection discards the annotations, including a
+                // label that is still being typed.
+                cancelTextEdit();
+                hideToolbar();
+                if (m_annotationEngine) m_annotationEngine->clear();
+                update();
+            }
+        } else if (m_selectionComplete && m_selectionLocked) {
+            // Selection locked — allow annotation drawing only
+            QRect selRect = normalizedSelectionRect();
+            bool isDrawingTool = (m_annotationEngine && m_annotationEngine->currentTool() != AnnotationEngine::None);
+            if (!isDrawingTool && m_annotationEngine && selRect.contains(event->pos())) {
+                const int idx = m_annotationEngine->findAnnotationAt(event->pos());
+                if (idx >= 0) {
+                    startAnnotationMove(idx, event->pos());
+                    return;
+                }
+            }
+            if (isDrawingTool && selRect.contains(event->pos())) {
+                QPoint rel = event->pos();
+                if (m_annotationEngine->currentTool() == AnnotationEngine::Eraser) {
+                    if (m_annotationEngine->eraseAnnotationAt(rel)) {
+                        update();
+                        updateUndoRedoState();
+                    }
+                } else {
+                    if (handleAnnotationPress(rel, event->modifiers()))
+                        return;
+                    m_annotationEngine->setSelectedIndex(-1);
+                    m_annotationEngine->beginDraw(rel);
+                    update();
+                }
+            }
+        } else {
+            if (!m_hoveredWindowRect.isEmpty()) {
+                m_windowSnapPressPosition = event->pos();
+                m_pressedWindowRect = m_hoveredWindowRect;
+                m_windowSnapClickPending = true;
+                event->accept();
+                return;
+            }
+            if (!manualSelectionAllowed()) {
+                event->accept();
+                return;
+            }
+            const QRect dismissedCaptureInfoRect = shouldShowCaptureHints(
+                m_showCaptureHints, m_isSelecting, m_selectionComplete,
+                m_eyedropperActive)
+                ? captureHintRect(monitorRectAt(event->pos()),
+                                  QSize(840, m_captureMode == ModeRecording ? 76 : 132))
+                : QRect();
+            m_isSelecting = true;
+            m_selectionStart = event->pos();
+            m_selectionEnd = event->pos();
+            m_selectionAnchorScreenRect = monitorRectAt(event->pos());
+            hideToolbar();
+            QRegion dirty = selectionStartUpdateRegion(
+                normalizedSelectionRect(), rect(), dismissedCaptureInfoRect);
+            if (m_hasCrosshairPosition) {
+                dirty += crosshairUpdateRegion(
+                    m_crosshairPosition, m_crosshairPosition, rect());
+            }
+            updateOverlayRegion(dirty);
+        }
+    } else if (event->button() == Qt::RightButton) {
+        if (m_eyedropperActive) {
+            // Eyedropper cancel
+            m_eyedropperActive = false;
+            m_eyedropperImage = QImage();
+            setCursor(Qt::CrossCursor);
+            update();
+            return;
+        }
+        if (m_selectionComplete || m_resizeMode != ResNone) {
+            resetSelection();
+        } else {
+            onClose();
+        }
+    }
+}
+
+void CaptureOverlay::resetGestureState()
+{
+    // A capture can end or restart while a mouse gesture is still held. Stale
+    // flags would swallow the next capture's first mouse release.
+    m_resizeMode = ResNone;
+    m_isDraggingAnnotation = false;
+    m_isRotatingAnnotation = false;
+    m_isResizingTextAnnotation = false;
+    m_textPanelDragging = false;
+}
+
+void CaptureOverlay::resetSelection()
+{
+    cancelTextEdit();
+    m_selectionComplete = false;
+    m_isSelecting = false;
+    m_windowSnapClickPending = false;
+    m_pressedWindowRect = QRect();
+    m_selectionLocked = false;
+    m_selectionStart = m_selectionEnd = QPoint();
+    m_selectionAnchorScreenRect = QRect();
+    resetGestureState();
+    if (m_toolbar) m_toolbar->setSelectionLocked(false);
+    hideToolbar();
+    if (m_annotationEngine) m_annotationEngine->clear();
+    acquireCaptureKeyboardFocus();
+    update();
+}
+
+void CaptureOverlay::startAnnotationMove(int index, const QPoint &pos)
+{
+    m_isDraggingAnnotation = true;
+    m_dragAnnotationStart = pos;
+    m_annotationEngine->setSelectedIndex(index);
+    m_annotationEngine->beginMove(index);
+    setCursor(Qt::SizeAllCursor);
+    update();
+}
+
+bool CaptureOverlay::handleAnnotationPress(const QPoint &pos, Qt::KeyboardModifiers modifiers)
+{
+    if (!m_annotationEngine)
+        return false;
+    const int hit = m_annotationEngine->findAnnotationAt(pos);
+    if (hit < 0)
+        return false;
+    if (m_annotationEngine->currentTool() == AnnotationEngine::Text
+        && m_annotationEngine->isTextAnnotation(hit)) {
+        beginEditExistingText(hit);
+        m_ignoreNextMouseRelease = true;
+        return true;
+    }
+    // A drawing tool draws, even over other annotations; brushing past one
+    // must not select it and drop the tool. The selected annotation can still
+    // be dragged, and Ctrl+click picks any other one, keeping the tool.
+    if (!(modifiers & Qt::ControlModifier) && hit != m_annotationEngine->selectedIndex()) {
+        if (!OnboardingTips::isSeen(OnboardingTips::CtrlMoveTip)) {
+            OnboardingTips::markSeen(OnboardingTips::CtrlMoveTip);
+            hintBubble()->showTip(TranslationManager::tr("tipCtrlMove"),
+                                  QRect(pos - QPoint(0, 18), QSize(1, 1)),
+                                  HintBubble::Pointer::Down, rect());
+        }
+        return false;
+    }
+    startAnnotationMove(hit, pos);
+    return true;
+}
+
+void CaptureOverlay::mouseDoubleClickEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton || m_eyedropperActive)
+        return;
+    // Inside a finished selection a quick second click belongs to the active
+    // tool; treating it as "select monitor" would wipe the annotations.
+    if (m_selectionComplete) {
+        // Double-clicking a label in select mode opens it for editing.
+        const int hit = m_annotationEngine && m_annotationEngine->currentTool() == AnnotationEngine::None
+            ? m_annotationEngine->findAnnotationAt(event->pos()) : -1;
+        if (hit >= 0 && m_annotationEngine->isTextAnnotation(hit)) {
+            if (m_isDraggingAnnotation) {
+                m_isDraggingAnnotation = false;
+                m_annotationEngine->endMove();
+            }
+            beginEditExistingText(hit);
+            m_ignoreNextMouseRelease = true;
+            return;
+        }
+        if (m_selectionLocked)
+            return;
+        mousePressEvent(event);
+        return;
+    }
+    if (!manualSelectionAllowed())
+        return;
+    if (m_toolbar && m_toolbar->isVisible() && m_toolbar->geometry().contains(event->pos()))
+        return;
+    if (m_actionPanel && m_actionPanel->isVisible() && m_actionPanel->geometry().contains(event->pos()))
+        return;
+    if (isToolSettingsUiAt(event->pos()))
+        return;
+
+    selectMonitorAt(event->pos());
+    m_ignoreNextMouseRelease = true;
+}
+
+QRegion CaptureOverlay::visibleSelectionUiRegion() const
+{
+    // Panels that follow the selection; their old and new places need a repaint.
+    QRegion region;
+    const QWidget *widgets[] = { m_toolbar, m_actionPanel, m_toolSettingsButton,
+                                 m_toolSettingsDrawer };
+    for (const QWidget *widget : widgets) {
+        if (widget && widget->isVisible())
+            region += widget->geometry().adjusted(-4, -4, 4, 4);
+    }
+    return region;
+}
+
+bool CaptureOverlay::handleSelectionNudgeKey(QKeyEvent *event)
+{
+    const SelectionNudge nudge = selectionNudgeForKey(event->key(), event->modifiers());
+    if (!nudge.valid || !m_selectionComplete || m_isSelecting || m_eyedropperActive
+        || m_resizeMode != ResNone || m_isDraggingAnnotation || m_isRotatingAnnotation
+        || m_isResizingTextAnnotation || (m_textEdit && m_textEdit->isVisible()))
+        return false;
+
+    // A selected object takes plain and Shift arrows, one undo step per
+    // press; Ctrl+arrows keep resizing the selection.
+    const int selectedAnnotation = m_annotationEngine ? m_annotationEngine->selectedIndex() : -1;
+    if (nudge.mode == SelectionNudgeMode::Move && selectedAnnotation >= 0) {
+        m_annotationEngine->beginMove(selectedAnnotation);
+        m_annotationEngine->moveAnnotation(selectedAnnotation, nudge.delta);
+        m_annotationEngine->endMove();
+        updateUndoRedoState();
+        update();
+        return true;
+    }
+
+    // Works while locked too: the lock only guards against mouse changes.
+    const QRect oldSel = normalizedSelectionRect();
+    const QRect newSel = nudgedSelection(oldSel, nudge.mode, nudge.delta, rect());
+    if (newSel == oldSel)
+        return true;
+
+    QRegion movingUiRegion = visibleSelectionUiRegion();
+    m_selectionStart = newSel.topLeft();
+    m_selectionEnd = newSel.bottomRight();
+    const bool nativeViews = m_screenViews && m_screenViews->isActive();
+    if ((m_toolbar && m_toolbar->isVisible())
+        || (nativeViews && m_recordingDrawerMode == RecordingDrawerMode::None))
+        showToolbar();
+    movingUiRegion += visibleSelectionUiRegion();
+    QRegion dirty = selectionUpdateRegion(oldSel, newSel, rect());
+    dirty += movingUiRegion.intersected(rect());
+    updateOverlayRegion(dirty);
+    return true;
+}
+
+void CaptureOverlay::updateOverlayRegion(const QRegion &region)
+{
+    if (shouldUsePartialOverlayUpdates(devicePixelRatioF()))
+        update(region);
+    else
+        update();
+}
+
+void CaptureOverlay::mouseMoveEvent(QMouseEvent *event)
+{
+    if (!m_captureInputSeen && m_captureLatencyTimer.isValid()) {
+        qInfo() << "[CaptureOverlay] first pointer movement accepted after"
+                << m_captureLatencyTimer.elapsed() << "ms";
+    }
+    noteCaptureInput();
+    // In Eyedropper mode — only repaint the preview circle + color label
+    if (m_eyedropperActive) {
+        constexpr int EyedropperRepaintMargin = 120;
+        const QPoint previousPosition = m_hasCrosshairPosition
+            ? m_crosshairPosition : event->pos();
+        m_crosshairPosition = event->pos();
+        m_hasCrosshairPosition = true;
+        QRegion dirty;
+        const QPoint positions[] = { previousPosition, event->pos() };
+        for (const QPoint &position : positions) {
+            dirty += QRect(position - QPoint(EyedropperRepaintMargin, EyedropperRepaintMargin),
+                           QSize(EyedropperRepaintMargin * 2, EyedropperRepaintMargin * 2))
+                         .intersected(rect());
+        }
+        updateOverlayRegion(dirty);
+        return;
+    }
+
+    if (m_windowSnapClickPending) {
+        if (!isWindowSnapClick(m_windowSnapPressPosition, event->pos(),
+                               QApplication::startDragDistance())) {
+            m_windowSnapClickPending = false;
+            m_pressedWindowRect = QRect();
+            if (manualSelectionAllowed()) {
+                setHoveredWindowRect(QRect());
+                m_isSelecting = true;
+                m_selectionStart = m_windowSnapPressPosition;
+                m_selectionEnd = event->pos();
+                m_selectionAnchorScreenRect = monitorRectAt(m_windowSnapPressPosition);
+                hideToolbar();
+            } else {
+                setHoveredWindowRect(windowSnapTargetForMode(
+                    m_selectionMode, m_windowSnapCandidates, event->pos(), rect()));
+            }
+        }
+        update();
+        return;
+    }
+
+    // Text annotation resize
+    if (m_isResizingTextAnnotation && m_annotationEngine
+        && m_annotationEngine->selectedIndex() >= 0) {
+        QRectF targetBounds = m_textResizeStartBounds;
+        const QPointF delta = event->pos() - m_textResizeDragStart;
+        switch (m_textResizeHandle) {
+        case TextResizeTopLeft:
+            targetBounds.setLeft(targetBounds.left() + delta.x());
+            targetBounds.setTop(targetBounds.top() + delta.y());
+            break;
+        case TextResizeTopRight:
+            targetBounds.setRight(targetBounds.right() + delta.x());
+            targetBounds.setTop(targetBounds.top() + delta.y());
+            break;
+        case TextResizeBottomLeft:
+            targetBounds.setLeft(targetBounds.left() + delta.x());
+            targetBounds.setBottom(targetBounds.bottom() + delta.y());
+            break;
+        case TextResizeBottomRight:
+            targetBounds.setRight(targetBounds.right() + delta.x());
+            targetBounds.setBottom(targetBounds.bottom() + delta.y());
+            break;
+        default:
+            return;
+        }
+
+        constexpr qreal minimumTextExtent = 8.0;
+        if (targetBounds.width() < minimumTextExtent) {
+            if (m_textResizeHandle == TextResizeTopLeft || m_textResizeHandle == TextResizeBottomLeft)
+                targetBounds.setLeft(targetBounds.right() - minimumTextExtent);
+            else
+                targetBounds.setRight(targetBounds.left() + minimumTextExtent);
+        }
+        if (targetBounds.height() < minimumTextExtent) {
+            if (m_textResizeHandle == TextResizeTopLeft || m_textResizeHandle == TextResizeTopRight)
+                targetBounds.setTop(targetBounds.bottom() - minimumTextExtent);
+            else
+                targetBounds.setBottom(targetBounds.top() + minimumTextExtent);
+        }
+
+        if (QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier)) {
+            const qreal scaleX = targetBounds.width() / m_textResizeStartBounds.width();
+            const qreal scaleY = targetBounds.height() / m_textResizeStartBounds.height();
+            const qreal scale = qAbs(scaleX - 1.0) >= qAbs(scaleY - 1.0) ? scaleX : scaleY;
+            const qreal width = m_textResizeStartBounds.width() * scale;
+            const qreal height = m_textResizeStartBounds.height() * scale;
+            switch (m_textResizeHandle) {
+            case TextResizeTopLeft:
+                targetBounds = QRectF(m_textResizeStartBounds.right() - width,
+                                      m_textResizeStartBounds.bottom() - height, width, height);
+                break;
+            case TextResizeTopRight:
+                targetBounds = QRectF(m_textResizeStartBounds.left(),
+                                      m_textResizeStartBounds.bottom() - height, width, height);
+                break;
+            case TextResizeBottomLeft:
+                targetBounds = QRectF(m_textResizeStartBounds.right() - width,
+                                      m_textResizeStartBounds.top(), width, height);
+                break;
+            case TextResizeBottomRight:
+                targetBounds = QRectF(m_textResizeStartBounds.left(),
+                                      m_textResizeStartBounds.top(), width, height);
+                break;
+            default:
+                break;
+            }
+        }
+
+        m_annotationEngine->resizeTextAnnotation(m_annotationEngine->selectedIndex(), targetBounds);
+        update();
+        return;
+    }
+
+    // Annotation rotation
+    if (m_isRotatingAnnotation && m_annotationEngine && m_annotationEngine->selectedIndex() >= 0) {
+        const qreal currentAngle = AnnotationRotationGeometry::angleAt(m_rotationCenter, event->pos());
+        qreal rotation = m_rotationStartDegrees + currentAngle - m_rotationDragStartAngle;
+        rotation = AnnotationRotationGeometry::snappedAngle(
+            rotation, QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier));
+        m_annotationEngine->rotateAnnotation(m_annotationEngine->selectedIndex(), rotation);
+        update();
+        return;
+    }
+
+    // Annotation move
+    if (m_isDraggingAnnotation && m_annotationEngine && m_annotationEngine->selectedIndex() >= 0) {
+        QRect selRect = normalizedSelectionRect();
+        QPoint rel = event->pos();
+        QPoint delta = rel - m_dragAnnotationStart;
+        if (!delta.isNull()) {
+            m_annotationEngine->moveAnnotation(m_annotationEngine->selectedIndex(), delta);
+            m_dragAnnotationStart = rel;
+            update();
+        }
+        return;
+    }
+
+    if (m_resizeMode != ResNone && m_resizeMode != ResNewSelection) {
+        QRect oldSel = normalizedSelectionRect();
+        const auto resizeSingleEdge = [this, &oldSel, event](SelectionResizeHandle handle) {
+            const QRect resized = resizedSelectionForHandle(oldSel, handle, event->pos());
+            m_selectionStart = resized.topLeft();
+            m_selectionEnd = resized.bottomRight();
+        };
+        QRegion movingUiRegion = visibleSelectionUiRegion();
+
+        if (m_resizeMode == ResMove) {
+            QPoint newTopLeft = event->pos() - m_moveOffset;
+            
+            int w = oldSel.width();
+            int h = oldSel.height();
+            QRect bounds = rect();   // logical overlay bounds
+            // qMax guard: a selection larger than the overlay must not make
+            // the clamp maximum underflow below the minimum.
+            const int maxX = qMax(bounds.left(), bounds.right() - w + 1);
+            const int maxY = qMax(bounds.top(), bounds.bottom() - h + 1);
+            newTopLeft.setX(qBound(bounds.left(), newTopLeft.x(), maxX));
+            newTopLeft.setY(qBound(bounds.top(), newTopLeft.y(), maxY));
+            m_selectionStart = newTopLeft;
+            m_selectionEnd = newTopLeft + QPoint(w - 1, h - 1);
+        } 
+        else if (m_resizeMode == ResTopLeft) {
+            m_selectionStart = event->pos();
+        } 
+        else if (m_resizeMode == ResTop) {
+            resizeSingleEdge(SelectionResizeHandle::Top);
+        }
+        else if (m_resizeMode == ResTopRight) {
+            m_selectionStart.setY(event->pos().y());
+            m_selectionEnd.setX(event->pos().x());
+        }
+        else if (m_resizeMode == ResRight) {
+            resizeSingleEdge(SelectionResizeHandle::Right);
+        }
+        else if (m_resizeMode == ResBottomLeft) {
+            m_selectionStart.setX(event->pos().x());
+            m_selectionEnd.setY(event->pos().y());
+        }
+        else if (m_resizeMode == ResBottomRight) {
+            m_selectionEnd = event->pos();
+        }
+        else if (m_resizeMode == ResBottom) {
+            resizeSingleEdge(SelectionResizeHandle::Bottom);
+        }
+        else if (m_resizeMode == ResLeft) {
+            resizeSingleEdge(SelectionResizeHandle::Left);
+        }
+
+        const bool nativeViews = m_screenViews && m_screenViews->isActive();
+        if (m_selectionComplete && ((m_toolbar && m_toolbar->isVisible())
+            || (nativeViews && m_recordingDrawerMode == RecordingDrawerMode::None)))
+            showToolbar();
+        movingUiRegion += visibleSelectionUiRegion();
+        QRegion dirty = selectionUpdateRegion(
+            oldSel, normalizedSelectionRect(), rect());
+        dirty += movingUiRegion.intersected(rect());
+        updateOverlayRegion(dirty);
+        return;
+    }
+
+    if (m_isSelecting) {
+        const QRect previousSelection = normalizedSelectionRect();
+        m_selectionEnd = event->pos();
+        updateOverlayRegion(selectionUpdateRegion(
+            previousSelection, normalizedSelectionRect(), rect()));
+    } else if (m_selectionComplete && m_annotationEngine &&
+               m_annotationEngine->currentTool() != AnnotationEngine::None) {
+        QRect selRect = normalizedSelectionRect();
+        if (selRect.contains(event->pos())) {
+            QPoint rel = event->pos();
+            if (m_annotationEngine->currentTool() == AnnotationEngine::Eraser) {
+                if ((event->buttons() & Qt::LeftButton) && m_annotationEngine->eraseAnnotationAt(rel))
+                    update();
+            } else {
+                m_annotationEngine->continueDraw(rel);
+                update();
+            }
+        }
+    } else if (!m_selectionComplete) {
+        const QRect hovered = windowSnapTargetForMode(
+            m_selectionMode, m_windowSnapCandidates, event->pos(), rect());
+        if (hovered != m_hoveredWindowRect) {
+            m_crosshairPosition = event->pos();
+            m_hasCrosshairPosition = true;
+            setHoveredWindowRect(hovered);
+        } else if (hovered.isEmpty()) {
+            const QPoint previousPosition = m_hasCrosshairPosition
+                ? m_crosshairPosition : event->pos();
+            const QRect previousMonitor = monitorRectAt(previousPosition);
+            const QRect currentMonitor = monitorRectAt(event->pos());
+            m_crosshairPosition = event->pos();
+            m_hasCrosshairPosition = true;
+            if (previousMonitor != currentMonitor)
+                update();
+            else if (shouldRepaintCrosshairOnMove(m_crosshairStyle))
+                updateOverlayRegion(crosshairUpdateRegion(previousPosition,
+                                                          m_crosshairPosition, rect()));
+        }
+    } else {
+        updateCursor(event->pos());
+    }
+}
+
+void CaptureOverlay::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (event->button() == Qt::LeftButton) {
+        if (m_ignoreNextMouseRelease) {
+            m_ignoreNextMouseRelease = false;
+            return;
+        }
+
+        if (m_windowSnapClickPending) {
+            const QRect selectedWindow = m_pressedWindowRect;
+            m_windowSnapClickPending = false;
+            m_pressedWindowRect = QRect();
+            if (isWindowSnapClick(m_windowSnapPressPosition, event->pos(),
+                                  QApplication::startDragDistance())) {
+                completeSelection(selectedWindow);
+            }
+            return;
+        }
+
+        // Text annotation resize end
+        if (m_isResizingTextAnnotation) {
+            m_isResizingTextAnnotation = false;
+            m_textResizeHandle = TextResizeNone;
+            if (m_annotationEngine)
+                m_annotationEngine->endTextResize();
+            setCursor(Qt::CrossCursor);
+            updateUndoRedoState();
+            update();
+            return;
+        }
+
+        // Annotation rotation end
+        if (m_isRotatingAnnotation) {
+            if (m_annotationEngine)
+                m_annotationEngine->endRotate();
+            m_isRotatingAnnotation = false;
+            setCursor(Qt::CrossCursor);
+            updateUndoRedoState();
+            update();
+            return;
+        }
+
+        // Annotation move end
+        if (m_isDraggingAnnotation) {
+            if (m_annotationEngine)
+                m_annotationEngine->endMove();
+            m_isDraggingAnnotation = false;
+            setCursor(Qt::CrossCursor);
+            updateUndoRedoState();
+            update();
+            return;
+        }
+
+        if (m_resizeMode != ResNone && m_resizeMode != ResNewSelection) {
+            m_resizeMode = ResNone;
+            updateCursor(event->pos());
+            showToolbar();
+            return;
+        }
+
+        if (m_isSelecting) {
+            m_isSelecting = false;
+            m_selectionEnd = event->pos();
+            QRect selRect = normalizedSelectionRect();
+            if (selRect.width() > 10 && selRect.height() > 10) {
+                completeSelection(selRect);
+                return;
+            }
+            update();
+        } else if (m_selectionComplete) {
+            QRect selRect = normalizedSelectionRect();
+            QPoint rel(qBound(selRect.left(), event->pos().x(), selRect.right()),
+                       qBound(selRect.top(), event->pos().y(), selRect.bottom()));
+
+            if (m_annotationEngine && m_annotationEngine->currentTool() == AnnotationEngine::Eraser) {
+                updateUndoRedoState();
+            } else if (m_annotationEngine && m_annotationEngine->currentTool() == AnnotationEngine::Text) {
+                if (selRect.contains(event->pos())) {
+                    beginTextEditAt(event->pos());
+                }
+            } else if (m_annotationEngine) {
+                // Counters also end here: the press placed the counter, and a
+                // drag to this point gives it a pointer.
+                m_annotationEngine->endDraw(rel);
+                update();
+                updateUndoRedoState();
+            }
+        }
+    }
+}
+
+void CaptureOverlay::keyPressEvent(QKeyEvent *event)
+{
+    noteCaptureInput();
+    // Any key closes the shortcut sheet; "?" or F1 opens it.
+    if (isShortcutSheetOpen()) {
+        if (event->key() != Qt::Key_Shift) {
+            m_shortcutSheet->hide();
+            update();
+        }
+        return;
+    }
+    if ((event->text() == QLatin1String("?") || event->key() == Qt::Key_F1)
+        && (!m_textEdit || !m_textEdit->isVisible())) {
+        toggleShortcutSheet();
+        return;
+    }
+    // Shift durumunu annotation engine'e bildir
+    if (event->key() == Qt::Key_Shift && m_annotationEngine) {
+        m_annotationEngine->setShiftHeld(true);
+    }
+
+    if (recordingDrawerStartsOnKey(event->key(), m_recordingDrawer && m_recordingDrawer->isVisible())) {
+        startRecordingFromDrawer();
+        return;
+    }
+    if (event->key() == Qt::Key_Escape) {
+        const bool recordingOpen = m_recordingDrawer && m_recordingDrawer->isVisible();
+        const bool quickSettingsOpen = m_toolSettingsDrawer
+            && m_toolSettingsDrawer->isVisible()
+            && !m_toolSettingsDrawer->property("closing").toBool();
+        if (escapeClosesOverlayMenu(recordingOpen, quickSettingsOpen)) {
+            if (recordingOpen)
+                hideRecordingDrawer();
+            if (quickSettingsOpen)
+                setToolSettingsDrawerVisible(false);
+            return;
+        }
+        // If eyedropper is active, just close it
+        if (m_eyedropperActive) {
+            m_eyedropperActive = false;
+            m_eyedropperImage = QImage();
+            update();
+            return;
+        }
+        // If text edit is open, just close it
+        if (m_textEdit && m_textEdit->isVisible()) {
+            cancelTextEdit();
+            m_textJustCommitted = false;
+            setFocus();
+            return;
+        }
+        if (m_selectionComplete || m_resizeMode != ResNone) {
+            resetSelection();
+        } else {
+            onClose();
+        }
+    } else if (matchesOverlayShortcut(event, QStringLiteral("actionCopy"), QStringLiteral("Ctrl+C"))) {
+        if (m_selectionComplete)
+            onCopyToClipboard();
+    } else if (matchesOverlayShortcut(event, QStringLiteral("actionSave"), QStringLiteral("Ctrl+S"))) {
+        if (m_selectionComplete)
+            onSave();
+    } else if (matchesOverlayShortcut(event, QStringLiteral("actionUndo"), QStringLiteral("Ctrl+Z"))) {
+        if (m_annotationEngine) { m_annotationEngine->undo(); update(); updateUndoRedoState(); }
+    } else if (matchesOverlayShortcut(event, QStringLiteral("actionRedo"), QStringLiteral("Ctrl+Shift+Z"))) {
+        if (m_annotationEngine) { m_annotationEngine->redo(); update(); updateUndoRedoState(); }
+    } else if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+        // If text edit is open and Shift is held, insert newline
+        if (m_textEdit && m_textEdit->isVisible()) {
+            if (event->modifiers() & Qt::ShiftModifier) {
+                m_textEdit->insertPlainText("\n");
+                return;
+            }
+            // If text edit was just closed, swallow Enter
+            commitText();
+            return;
+        }
+        if (m_textJustCommitted) {
+            m_textJustCommitted = false;
+            return;
+        }
+        if (m_selectionComplete) onCopyToClipboard();
+    } else if (m_selectionComplete && m_annotationEngine) {
+        const int selectedAnnotation = m_annotationEngine->selectedIndex();
+        if (selectedAnnotation >= 0
+            && (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace)) {
+            m_annotationEngine->removeAnnotation(selectedAnnotation);
+            update();
+            updateUndoRedoState();
+            return;
+        }
+        if (event->key() == Qt::Key_F2 && m_annotationEngine->isTextAnnotation(selectedAnnotation)) {
+            beginEditExistingText(selectedAnnotation);
+            return;
+        }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionEyedropper"), QStringLiteral("I"))) { onEyedropperRequested(); return; }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionLock"), QStringLiteral("K"))) { onSelectionLockToggled(!m_selectionLocked); return; }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionPin"), QStringLiteral("Ctrl+P"))) { onPinToDesktop(); return; }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionOcr"), QStringLiteral("Ctrl+O"))) { onOcrRequested(); return; }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionUpload"), QStringLiteral("Ctrl+U"))) { onUploadRequested(); return; }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionGoogleLens"), QStringLiteral("Ctrl+L"))) { onGoogleLensRequested(); return; }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionGif"), QStringLiteral("Ctrl+G"))) { onGifRequested(); return; }
+        if (matchesOverlayShortcut(event, QStringLiteral("actionVideo"), QStringLiteral("Ctrl+Shift+V"))) { onVideoRequested(); return; }
+
+        if (matchesOverlayShortcut(event, QStringLiteral("toolPen"), QStringLiteral("P"))) selectAnnotationTool(AnnotationEngine::Pen);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolArrow"), QStringLiteral("A"))) selectAnnotationTool(AnnotationEngine::Arrow);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolLine"), QStringLiteral("L"))) selectAnnotationTool(AnnotationEngine::Line);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolRectangle"), QStringLiteral("R"))) selectAnnotationTool(AnnotationEngine::Rectangle);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolCircle"), QStringLiteral("C"))) selectAnnotationTool(AnnotationEngine::Circle);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolText"), QStringLiteral("T"))) selectAnnotationTool(AnnotationEngine::Text);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolHighlighter"), QStringLiteral("H"))) selectAnnotationTool(AnnotationEngine::Highlighter);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolSemiRect"), QStringLiteral("D"))) selectAnnotationTool(AnnotationEngine::SemiRect);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolBlur"), QStringLiteral("B"))) selectAnnotationTool(AnnotationEngine::Blur);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolPixelate"), QStringLiteral("M"))) selectAnnotationTool(AnnotationEngine::Pixelate);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolCounter"), QStringLiteral("N"))) selectAnnotationTool(AnnotationEngine::Counter);
+        else if (matchesOverlayShortcut(event, QStringLiteral("toolEraser"), QStringLiteral("X"))) selectAnnotationTool(AnnotationEngine::Eraser);
+        // Arrows come last so a shortcut configured on an arrow key wins.
+        else handleSelectionNudgeKey(event);
+    }
+}
+
+void CaptureOverlay::keyReleaseEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_Shift && m_annotationEngine) {
+        m_annotationEngine->setShiftHeld(false);
+    }
+}
+
+QWidget *CaptureOverlay::managedOverlayInputAt(const QPoint &globalPosition) const
+{
+    QList<QRect> editorRects;
+    QList<QWidget *> inputs;
+    const QList<QLineEdit *> lineEdits = findChildren<QLineEdit *>();
+    for (QLineEdit *editor : lineEdits) {
+        if (!editor || !editor->isVisible() || !editor->isEnabled())
+            continue;
+        editorRects.append(QRect(editor->mapToGlobal(QPoint()), editor->size()));
+        inputs.append(editor);
+    }
+
+    const QList<QComboBox *> comboBoxes = findChildren<QComboBox *>();
+    for (QComboBox *combo : comboBoxes) {
+        if (!combo || !combo->isVisible() || !combo->isEnabled())
+            continue;
+        editorRects.append(QRect(combo->mapToGlobal(QPoint()), combo->size()));
+        inputs.append(combo);
+    }
+
+    const int index = overlayEditorIndexAt(editorRects, globalPosition);
+    return index >= 0 ? inputs.at(index) : nullptr;
+}
+
+bool CaptureOverlay::eventFilter(QObject *obj, QEvent *event)
+{
+    if (event->type() == QEvent::MouseButtonPress) {
+        const QPoint globalPosition = static_cast<QMouseEvent *>(event)
+            ->globalPosition().toPoint();
+        QWidget *input = managedOverlayInputAt(globalPosition);
+        if (!input)
+            input = overlaySpinBoxEditor(obj);
+        if (input) {
+            auto *lineEdit = qobject_cast<QLineEdit *>(input);
+            m_managedOverlayEditorSelectAll = lineEdit != nullptr;
+            m_managedOverlayEditor = input;
+            input->setFocus(Qt::MouseFocusReason);
+            if (lineEdit && shouldSelectOverlayEditorOnPointerPress(true)) {
+                const QPointer<QLineEdit> guardedEditor(lineEdit);
+                QTimer::singleShot(0, this, [guardedEditor]() {
+                    if (guardedEditor)
+                        guardedEditor->selectAll();
+                });
+            }
+        } else {
+            m_managedOverlayEditor = nullptr;
+            m_managedOverlayEditorSelectAll = false;
+        }
+    }
+
+    const bool proxyWindow = m_textFocusProxy && obj == m_textFocusProxy->windowHandle();
+    if (m_textFocusProxy
+        && isManagedProxyInputSource(obj == m_textFocusProxy, proxyWindow)) {
+        if (m_managedOverlayEditor.isNull()) {
+            m_managedOverlayEditor = managedOverlayInputAt(QCursor::pos());
+            m_managedOverlayEditorSelectAll =
+                qobject_cast<QLineEdit *>(m_managedOverlayEditor.data()) != nullptr;
+        }
+        const ManagedProxyKeyDestination destination = managedProxyKeyDestination(
+            m_textEdit && m_textEdit->isVisible(), !m_managedOverlayEditor.isNull());
+        if (destination == ManagedProxyKeyDestination::OverlayInput
+            && m_managedOverlayEditor->isVisible() && m_managedOverlayEditor->isEnabled()
+            && (event->type() == QEvent::KeyPress || event->type() == QEvent::KeyRelease)) {
+            auto *keyEvent = static_cast<QKeyEvent *>(event);
+            if (event->type() == QEvent::KeyPress && m_managedOverlayEditorSelectAll) {
+                if (auto *lineEdit = qobject_cast<QLineEdit *>(m_managedOverlayEditor.data()))
+                    lineEdit->selectAll();
+                m_managedOverlayEditorSelectAll = false;
+            }
+            QKeyEvent forwarded(event->type(), keyEvent->key(), keyEvent->modifiers(),
+                                keyEvent->text(), keyEvent->isAutoRepeat(), keyEvent->count());
+            QCoreApplication::sendEvent(m_managedOverlayEditor, &forwarded);
+            return true;
+        }
+        if (destination == ManagedProxyKeyDestination::CaptureOverlay
+            && event->type() == QEvent::KeyPress) {
+            keyPressEvent(static_cast<QKeyEvent *>(event));
+            return true;
+        }
+        if (destination == ManagedProxyKeyDestination::CaptureOverlay
+            && event->type() == QEvent::KeyRelease) {
+            keyReleaseEvent(static_cast<QKeyEvent *>(event));
+            return true;
+        }
+    }
+
+    if ((obj == m_textMoveHandle || obj == m_textEditPanel) && m_textEdit && m_textEdit->isVisible()) {
+        if (event->type() == QEvent::MouseButtonPress) {
+            QMouseEvent *me = static_cast<QMouseEvent*>(event);
+            if (me->button() == Qt::LeftButton) {
+                m_textPanelDragging = true;
+                m_textPanelDragOffset = capturePositionFromGlobal(me->globalPosition().toPoint()) - m_textEditPosition;
+                return true;
+            }
+        } else if (event->type() == QEvent::MouseMove && m_textPanelDragging) {
+            QMouseEvent *me = static_cast<QMouseEvent*>(event);
+            moveTextEditorTo(capturePositionFromGlobal(me->globalPosition().toPoint()) - m_textPanelDragOffset);
+            return true;
+        } else if (event->type() == QEvent::MouseButtonRelease && m_textPanelDragging) {
+            m_textPanelDragging = false;
+            return true;
+        }
+    }
+
+    if ((obj == m_textEdit || obj == m_textFocusProxy) && event->type() == QEvent::KeyPress) {
+        QKeyEvent *ke = static_cast<QKeyEvent*>(event);
+        if (ke->modifiers() & Qt::ControlModifier) {
+            if (ke->key() == Qt::Key_B && m_textBoldButton) {
+                m_textBoldButton->toggle();
+                return true;
+            }
+            if ((ke->key() == Qt::Key_Plus || ke->key() == Qt::Key_Equal) && m_textInlineSizeSpin) {
+                m_textInlineSizeSpin->stepBy(2);
+                return true;
+            }
+            if (ke->key() == Qt::Key_Minus && m_textInlineSizeSpin) {
+                m_textInlineSizeSpin->stepBy(-2);
+                return true;
+            }
+        }
+        if (ke->key() == Qt::Key_Escape) {
+            cancelTextEdit();
+            return true;
+        }
+        if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter) {
+            // Shift+Enter → newline
+            if (ke->modifiers() & Qt::ShiftModifier) {
+                if (auto *edit = qobject_cast<QTextEdit *>(obj))
+                    edit->insertPlainText("\n");
+                return true;
+            }
+            // Enter → confirm directly
+            commitText();
+            return true; // consume event
+        }
+    }
+
+    // Overlay controls such as toolbar buttons and sliders can keep widget
+    // focus after a click. While an annotation is active, route shortcuts
+    // back to the capture canvas unless the user is actively editing text.
+    // Modal dialogs (save errors, colour picker) keep their own keys.
+    if (obj != this && isVisible() && m_selectionComplete
+        && !QApplication::activeModalWidget()
+        && (!m_textEdit || !m_textEdit->isVisible())) {
+        // Let overlay child editors (spin boxes, combos incl. their popups,
+        // line edits) keep their keystrokes instead of consuming them here.
+        QWidget *focused = QApplication::focusWidget();
+        bool editorHasFocus = obj == m_managedOverlayEditor;
+        for (QWidget *w = focused; w; w = w->parentWidget()) {
+            if (qobject_cast<QLineEdit *>(w) || qobject_cast<QAbstractSpinBox *>(w)
+                || qobject_cast<QComboBox *>(w)) {
+                editorHasFocus = true;
+                break;
+            }
+        }
+        if (!editorHasFocus) {
+            if (event->type() == QEvent::KeyPress) {
+                keyPressEvent(static_cast<QKeyEvent *>(event));
+                return true;
+            }
+            if (event->type() == QEvent::KeyRelease) {
+                keyReleaseEvent(static_cast<QKeyEvent *>(event));
+                return true;
+            }
+        }
+    }
+    return QWidget::eventFilter(obj, event);
+}
+
+QPixmap CaptureOverlay::getSelectedPixmap(qreal *outputScaleOut)
+{
+    // Copy, save, pin, OCR and upload all compose through here; include text
+    // the user typed but has not confirmed yet.
+    if (m_textEdit && m_textEdit->isVisible())
+        commitText();
+    QRect selRect = normalizedSelectionRect();
+    if (selRect.isEmpty()) return QPixmap();
+    // Crop at full physical resolution (selRect is logical).
+    const QRect globalSelection = selRect.translated(m_virtualDesktopRect.topLeft());
+    const qreal outputScale = m_screenImages.isEmpty()
+        ? m_dpr : captureSelectionScale(m_screenImages, globalSelection);
+    QPixmap result = m_screenImages.isEmpty()
+        ? m_screenSnapshot.copy(logicalToSnapshot(selRect))
+        : QPixmap::fromImage(composeCaptureImages(m_screenImages, globalSelection));
+    if (outputScaleOut)
+        *outputScaleOut = outputScale;
+    if (result.isNull())
+        return result;
+    if (m_annotationEngine && m_annotationEngine->hasAnnotations()) {
+        QPainter p(&result);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        // Annotations are authored in logical coordinates; scale them up to the
+        // physical-resolution result.
+        p.scale(outputScale, outputScale);
+        m_annotationEngine->render(&p, -selRect.topLeft());
+        p.end();
+    }
+    return result;
+}
+
+QString CaptureOverlay::resolveFilenamePattern(const QString &pattern) const
+{
+    QDateTime now = QDateTime::currentDateTime();
+    QString result = pattern;
+
+    result.replace("%Y", now.toString("yyyy"));
+    result.replace("%y", now.toString("yy"));
+    result.replace("%M", now.toString("MM"));
+    result.replace("%D", now.toString("dd"));
+    result.replace("%h", now.toString("HH"));
+    result.replace("%m", now.toString("mm"));
+    result.replace("%s", now.toString("ss"));
+    result = applyWindowTitleToken(result, resolveWindowTitle());
+    if (result.trimmed().isEmpty())
+        result = QStringLiteral("Screenshot_%1").arg(now.toString(QStringLiteral("yyyy-MM-dd_HH-mm-ss")));
+    return result;
+}
+
+QString CaptureOverlay::resolveWindowTitle() const
+{
+#ifdef Q_OS_WIN
+    // Use saved foreground window (the one active before overlay)
+    HWND hwnd = m_foregroundHwnd;
+    if (!hwnd) hwnd = GetForegroundWindow();
+    if (hwnd) {
+        wchar_t title[256];
+        int len = GetWindowTextW(hwnd, title, 256);
+        if (len > 0) {
+            QString windowTitle = QString::fromWCharArray(title, len);
+            windowTitle.replace(QRegularExpression("[\\\\/:*?\"<>|]"), "_");
+            return windowTitle.left(50);
+        }
+    }
+#else
+    if (!m_capturedWindowTitle.isEmpty()) {
+        QString windowTitle = m_capturedWindowTitle;
+        windowTitle.replace(QRegularExpression("[\\\\/:*?\"<>|]"), "_");
+        return windowTitle.left(50).trimmed();
+    }
+#endif
+    return "";
+}
+
+void CaptureOverlay::showToolbar()
+{
+    if (!m_toolbar) return;
+    QRect selRect = normalizedSelectionRect();
+    int margin = 12;
+    const bool nativeViews = m_screenViews && m_screenViews->isActive();
+    QRect toolbarBounds = m_selectionAnchorScreenRect.isValid()
+        ? m_selectionAnchorScreenRect : monitorRectAt(selRect.center());
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    if (nativeViews) {
+        QList<QRect> monitors;
+        for (QScreen *screen : QGuiApplication::screens()) {
+            monitors.append(screen->geometry().translated(-m_virtualDesktopRect.topLeft())
+                                .intersected(rect()));
+        }
+        toolbarBounds = selectionUiMonitorRect(selRect, monitors, m_selectionAnchorScreenRect);
+        if (toolbarBounds.isValid())
+            m_selectionAnchorScreenRect = toolbarBounds;
+    }
+#endif
+    if (!toolbarBounds.isValid())
+        toolbarBounds = rect();
+    toolbarBounds = toolbarBounds.intersected(rect()).adjusted(5, 5, -5, -5);
+    if (!toolbarBounds.isValid())
+        toolbarBounds = rect().adjusted(5, 5, -5, -5);
+
+    if (!nativeViews)
+        m_toolbar->refreshTools();
+    QRect toolbarRect;
+    if (m_toolbar->hasVisibleTools()) {
+        // --- Bottom toolbar: below the selection, centered ---
+        if (!nativeViews)
+            m_toolbar->adjustSize();
+        int th = m_toolbar->height();
+        int toolbarWidth = m_toolbar->width();
+
+        int tx = selRect.center().x() - toolbarWidth / 2;
+        int ty = selRect.bottom() + margin;
+
+        if (toolbarWidth <= toolbarBounds.width()) {
+            if (tx < toolbarBounds.left()) tx = toolbarBounds.left();
+            if (tx + toolbarWidth > toolbarBounds.right() + 1)
+                tx = toolbarBounds.right() + 1 - toolbarWidth;
+        } else {
+            tx = toolbarBounds.left();
+        }
+        if (ty + th > toolbarBounds.bottom() + 1) {
+            // If it does not fit below, try above
+            ty = selRect.top() - th - margin;
+        }
+        if (ty < toolbarBounds.top()) {
+            // If it also does not fit above, dock to bottom inside the frame
+            ty = selRect.bottom() - th - 2;
+        }
+        if (ty + th > toolbarBounds.bottom() + 1)
+            ty = toolbarBounds.bottom() + 1 - th;
+        if (ty < toolbarBounds.top())
+            ty = toolbarBounds.top();
+
+        if (!nativeViews)
+            m_toolbar->setFixedWidth(toolbarWidth);
+        m_toolbar->move(tx, ty);
+        m_toolbar->show();
+        m_toolbar->raise();
+        toolbarRect = m_toolbar->geometry();
+    } else {
+        m_toolbar->hide();
+    }
+
+    // --- Right panel: right of selection, vertically centered ---
+    if (m_actionPanel) {
+        m_actionPanel->adjustSize();
+        int pw = m_actionPanel->width();
+        int ph = m_actionPanel->height();
+        int px = selRect.right() + margin;
+        int py = selRect.center().y() - ph / 2;
+        bool dockedInside = false;
+
+        if (px + pw > toolbarBounds.right() + 1) {
+            int leftOutside = selRect.left() - margin - pw;
+            if (leftOutside >= toolbarBounds.left()) {
+                px = leftOutside;
+            } else {
+                px = selRect.right() - pw - 2;
+                dockedInside = true;
+            }
+        }
+
+        if (dockedInside && px < selRect.left() + 2)
+            px = selRect.left() + 2;
+        if (px + pw > toolbarBounds.right() + 1)
+            px = toolbarBounds.right() + 1 - pw;
+        if (px < toolbarBounds.left())
+            px = toolbarBounds.left();
+
+        if (dockedInside && py < selRect.top() + 2)
+            py = selRect.top() + 2;
+        if (dockedInside && py + ph > selRect.bottom() - 2)
+            py = selRect.bottom() - ph - 2;
+        if (py < toolbarBounds.top())
+            py = toolbarBounds.top();
+        if (py + ph > toolbarBounds.bottom() + 1)
+            py = toolbarBounds.bottom() + 1 - ph;
+
+        if (toolbarRect.isValid()) {
+            auto panelRectAt = [&](int y) {
+                return QRect(px, y, pw, ph).adjusted(-4, -4, 4, 4);
+            };
+            auto inBounds = [&](int y) {
+                if (dockedInside)
+                    return y >= selRect.top() + 2 && y + ph <= selRect.bottom() - 2;
+                return y >= toolbarBounds.top() && y + ph <= toolbarBounds.bottom() + 1;
+            };
+            auto tryY = [&](int candidate, int &outY) {
+                if (!inBounds(candidate))
+                    return false;
+                if (panelRectAt(candidate).intersects(toolbarRect.adjusted(-4, -4, 4, 4)))
+                    return false;
+                outY = candidate;
+                return true;
+            };
+
+            int adjustedY = py;
+            if (panelRectAt(py).intersects(toolbarRect.adjusted(-4, -4, 4, 4))) {
+                if (!tryY(toolbarRect.top() - ph - margin, adjustedY)
+                    && !tryY(toolbarRect.bottom() + margin, adjustedY)
+                    && !tryY(selRect.top() + 2, adjustedY)
+                    && !tryY(selRect.bottom() - ph - 2, adjustedY)) {
+                    adjustedY = py;
+                }
+                py = adjustedY;
+            }
+        }
+
+        m_actionPanel->move(px, py);
+        m_actionPanel->show();
+        m_actionPanel->raise();
+    }
+
+    updateToolSettingsDrawerPosition();
+}
+
+void CaptureOverlay::hideToolbar()
+{
+    if (m_hintBubble)
+        m_hintBubble->hide();
+    if (m_toolbar) m_toolbar->hide();
+    if (m_actionPanel) m_actionPanel->hide();
+    if (m_toolSettingsButton) m_toolSettingsButton->hide();
+    if (m_toolSettingsDrawer) m_toolSettingsDrawer->hide();
+    if (m_recordingDrawer) m_recordingDrawer->hide();
+    m_recordingDrawerMode = RecordingDrawerMode::None;
+    m_managedOverlayEditor = nullptr;
+    m_managedOverlayEditorSelectAll = false;
+    if (m_textEditPanel) m_textEditPanel->hide();
+    releaseTextKeyboardFocus();
+    if (m_textFocusProxy) m_textFocusProxy->hide();
+}
+
+void CaptureOverlay::finishCapture()
+{
+    QRect selRect = normalizedSelectionRect();
+    const bool recordingMode = m_captureMode == ModeRecording;
+    QPixmap result;
+    if (shouldComposeCaptureResult(recordingMode))
+        result = getSelectedPixmap();
+    hide();
+    m_selectionComplete = false;
+    m_isSelecting = false;
+    m_selectionAnchorScreenRect = QRect();
+    hideToolbar();
+    cancelTextEdit();
+
+    if (recordingMode) {
+        m_captureMode = ModeNormal;
+        const QRect captureRect = selectedCaptureRect();
+        const QRect displayRect = selectedDisplayRect();
+        releaseCaptureBuffers();
+        if (!selRect.isEmpty())
+            emit regionSelected(captureRect, displayRect);
+        return;
+    }
+
+    // Play sound (if setting is enabled)
+    QSettings s("EShot", "EShot");
+    if (s.value("playSound", false).toBool()) {
+#ifdef Q_OS_WIN
+        MessageBeep(MB_OK);
+#else
+        QApplication::beep();
+#endif
+    }
+
+    releaseCaptureBuffers();
+    if (!result.isNull()) emit captureCompleted(result);
+}
+
+void CaptureOverlay::cancelCapture()
+{
+    hide();
+    m_selectionComplete = false;
+    m_isSelecting = false;
+    m_selectionAnchorScreenRect = QRect();
+    hideToolbar();
+    cancelTextEdit();
+    releaseCaptureBuffers();
+    emit captureCancelled();
+}
+
+void CaptureOverlay::releaseCaptureBuffers()
+{
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    LinuxFastCapture::instance().setOverlayVisible(false);
+#endif
+    if (m_screenViews)
+        m_screenViews->hideViews();
+    m_eyedropperImage = QImage();
+    m_screenSnapshot = QPixmap();
+    m_screenImages.clear();
+    if (m_annotationEngine)
+        m_annotationEngine->releaseScreenSnapshot();
+}
+
+void CaptureOverlay::beginTextEditAt(const QPoint &pos)
+{
+    if (!m_textEdit || !m_annotationEngine)
+        return;
+
+    // Clicking elsewhere while typing starts a new label; keep the old one.
+    if (m_textEdit->isVisible()) {
+        commitText();
+        m_textJustCommitted = false;
+    }
+
+    {
+        QSignalBlocker fontBlocker(m_textInlineFontCombo);
+        QSignalBlocker sizeBlocker(m_textInlineSizeSpin);
+        if (m_textInlineFontCombo)
+            m_textInlineFontCombo->setCurrentFont(QFont(m_annotationEngine->textFontFamily()));
+        if (m_textInlineSizeSpin)
+            m_textInlineSizeSpin->setValue(m_annotationEngine->textFontSize());
+    }
+    refreshTextStyleButtons();
+
+    m_textEdit->clear();
+    if (m_textFocusProxy)
+        m_textFocusProxy->clear();
+    m_textEdit->setFixedHeight(30);
+    updateTextEditorStyle();
+    moveTextEditorTo(pos);
+    m_textEdit->show();
+    if (m_textEditPanel)
+        m_textEditPanel->show();
+    updateTextEditPanelPosition();
+    acquireTextKeyboardFocus();
+}
+
+void CaptureOverlay::acquireTextKeyboardFocus()
+{
+    if (!m_textEdit)
+        return;
+
+    if (!m_textFocusProxy) {
+        m_textEdit->setFocus(Qt::MouseFocusReason);
+        return;
+    }
+
+    const QPoint proxyPosition = mapToGlobal(m_textEditPosition + QPoint(4, 4));
+    m_textFocusProxy->move(proxyPosition);
+    m_textFocusProxy->show();
+    m_textFocusProxy->raise();
+    if (QWindow *window = m_textFocusProxy->windowHandle())
+        window->requestActivate();
+    m_textFocusProxy->activateWindow();
+    m_textFocusProxy->setFocus(Qt::MouseFocusReason);
+    qInfo() << "[CaptureOverlay] requested managed text input focus; activeWindow="
+            << QApplication::activeWindow()
+            << "focusWidget=" << QApplication::focusWidget();
+}
+
+void CaptureOverlay::acquireCaptureKeyboardFocus()
+{
+    if (!m_textFocusProxy) {
+        activateWindow();
+        if (windowHandle())
+            windowHandle()->requestActivate();
+        setFocus(Qt::ActiveWindowFocusReason);
+        return;
+    }
+
+    m_textFocusProxy->move(mapToGlobal(QPoint(4, 4)));
+    m_textFocusProxy->show();
+    m_textFocusProxy->raise();
+    if (QWindow *window = m_textFocusProxy->windowHandle())
+        window->requestActivate();
+    m_textFocusProxy->activateWindow();
+    m_textFocusProxy->setFocus(Qt::ActiveWindowFocusReason);
+    if (shouldGrabCaptureKeyboardFromManagedProxy(
+            m_textFocusProxy != nullptr, isVisible(), m_selectionComplete,
+            m_textEdit && m_textEdit->isVisible())
+        && QWidget::keyboardGrabber() != m_textFocusProxy) {
+        m_textFocusProxy->grabKeyboard();
+    }
+    qInfo() << "[CaptureOverlay] managed capture focus requested; activeWindow="
+            << QApplication::activeWindow()
+            << "focusWidget=" << QApplication::focusWidget()
+            << "keyboardGrabber=" << QWidget::keyboardGrabber();
+}
+
+void CaptureOverlay::acquireCaptureActivation()
+{
+    if (!m_textFocusProxy)
+        return;
+    m_textFocusProxy->move(mapToGlobal(QPoint(4, 4)));
+    m_textFocusProxy->show();
+    m_textFocusProxy->raise();
+    if (QWindow *window = m_textFocusProxy->windowHandle())
+        window->requestActivate();
+    m_textFocusProxy->activateWindow();
+    m_textFocusProxy->setFocus(Qt::ActiveWindowFocusReason);
+}
+
+void CaptureOverlay::beginCaptureActivation()
+{
+    m_showInputBlockedBanner = false;
+    m_compositorActivationRequested = false;
+    m_captureInputSeen = true;
+    if (QWidget::keyboardGrabber() == this) {
+        m_captureInputSeen = false;
+        qInfo() << "[CaptureOverlay] unmanaged overlay grabbed keyboard directly";
+        return;
+    }
+    if (!shouldActivateManagedProxyOnPresent(
+            m_textFocusProxy != nullptr, m_screenViews && m_screenViews->isActive())) {
+        return;
+    }
+    m_captureInputSeen = false;
+    acquireCaptureActivation();
+    m_captureActivationTimer.start();
+    QPointer<CaptureOverlay> self(this);
+    const quint64 generation = m_captureGeneration;
+    for (const int delay : {CaptureActivationCheckMs, CaptureInputBannerMs}) {
+        QTimer::singleShot(delay, this, [self, generation]() {
+            if (self && generation == self->m_captureGeneration)
+                self->checkCaptureActivation();
+        });
+    }
+}
+
+void CaptureOverlay::checkCaptureActivation()
+{
+    if (!isVisible() || !m_textFocusProxy || !m_captureActivationTimer.isValid())
+        return;
+    QWindow *proxyWindow = m_textFocusProxy->windowHandle();
+    const bool proxyActive = proxyWindow && QGuiApplication::focusWindow() == proxyWindow;
+    bool kde = false;
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    kde = LinuxDesktopIntegration::detect(qEnvironmentVariable("XDG_CURRENT_DESKTOP"),
+                                          qEnvironmentVariable("XDG_SESSION_DESKTOP"))
+        == LinuxDesktopEnvironment::Kde;
+#endif
+    const CaptureActivationAction action = captureActivationAction(
+        m_captureActivationTimer.elapsed(), proxyActive, m_captureInputSeen,
+        m_compositorActivationRequested, kde);
+    qInfo() << "[CaptureOverlay] activation check: proxyActive=" << proxyActive
+            << "inputSeen=" << m_captureInputSeen << "action=" << int(action);
+    if (action == CaptureActivationAction::RequestCompositorActivation) {
+        m_compositorActivationRequested = true;
+        // The proxy must be mapped for KWin to find it.
+        acquireCaptureActivation();
+        LinuxKWinActivation::requestActivation(QCoreApplication::applicationPid(),
+                                               m_textFocusProxy->windowTitle());
+    } else if (action == CaptureActivationAction::ShowInputBlockedBanner
+               && !m_showInputBlockedBanner) {
+        m_showInputBlockedBanner = true;
+        update();
+    }
+}
+
+void CaptureOverlay::noteCaptureInput()
+{
+    if (m_captureInputSeen)
+        return;
+    m_captureInputSeen = true;
+    if (m_showInputBlockedBanner) {
+        m_showInputBlockedBanner = false;
+        update();
+    }
+}
+
+QString CaptureOverlay::inputBlockedBannerText() const
+{
+    QString cancelKey = HotkeyManager::instance().activeShortcutText(HotkeyManager::HOTKEY_CAPTURE);
+    if (cancelKey.isEmpty())
+        cancelKey = QStringLiteral("Esc");
+    const QString screenKey = HotkeyManager::instance().activeShortcutText(
+        HotkeyManager::HOTKEY_SCREEN_CAPTURE);
+    if (!screenKey.isEmpty())
+        return TranslationManager::tr("inputBlockedBannerScreen").arg(cancelKey, screenKey);
+    return TranslationManager::tr("inputBlockedBanner").arg(cancelKey);
+}
+
+void CaptureOverlay::releaseTextKeyboardFocus()
+{
+    if (QWidget::keyboardGrabber() == this)
+        releaseKeyboard();
+    if (QWidget::keyboardGrabber() == m_textEdit)
+        m_textEdit->releaseKeyboard();
+    if (m_textFocusProxy && QWidget::keyboardGrabber() == m_textFocusProxy)
+        m_textFocusProxy->releaseKeyboard();
+}
+
+void CaptureOverlay::moveTextEditorTo(const QPoint &pos)
+{
+    if (!m_textEdit)
+        return;
+
+    QRect selRect = normalizedSelectionRect();
+    const int editWidth = qBound(80, selRect.width() - 8, 260);
+    const int editHeight = qMax(30, m_textEdit->height());
+    const int minX = selRect.left() + 4;
+    const int maxX = qMax(minX, selRect.right() - editWidth - 4);
+    const int minY = selRect.top() + 4;
+    const int maxY = qMax(minY, selRect.bottom() - editHeight - 4);
+    int x = qBound(minX, pos.x(), maxX);
+    int y = qBound(minY, pos.y(), maxY);
+    m_textEditPosition = QPoint(x, y);
+    m_textEdit->setGeometry(x, y, editWidth, editHeight);
+    updateTextEditPanelPosition();
+}
+
+void CaptureOverlay::updateTextEditorStyle()
+{
+    if (!m_textEdit || !m_annotationEngine)
+        return;
+
+    QFont textFont(m_annotationEngine->textFontFamily(), m_annotationEngine->textFontSize());
+    textFont.setBold(m_annotationEngine->textBold());
+    m_textEdit->setFont(textFont);
+    m_textEdit->setStyleSheet(QString(R"(
+        QTextEdit {
+            background-color: rgba(0, 0, 0, 180);
+            color: %1;
+            border: 2px solid #0078D4;
+            border-radius: 4px;
+            padding: 4px 8px;
+        }
+    )").arg(m_annotationEngine->color().name()));
+}
+
+void CaptureOverlay::updateTextEditPanelPosition()
+{
+    if (!m_textEditPanel || !m_textEdit || !m_textEdit->isVisible())
+        return;
+
+    m_textEditPanel->adjustSize();
+    QRect selRect = normalizedSelectionRect();
+    int x = m_textEdit->x();
+    int y = m_textEdit->y() - m_textEditPanel->height() - 6;
+    if (y < selRect.top() + 4)
+        y = m_textEdit->geometry().bottom() + 6;
+    if (x + m_textEditPanel->width() > selRect.right() - 4)
+        x = selRect.right() - m_textEditPanel->width() - 4;
+    if (x < selRect.left() + 4)
+        x = selRect.left() + 4;
+    if (y + m_textEditPanel->height() > selRect.bottom() - 4)
+        y = qMax(selRect.top() + 4, m_textEdit->y() - m_textEditPanel->height() - 6);
+    // A narrow selection at a screen edge must not push the panel's
+    // confirm/cancel buttons off the monitor.
+    const QRect monitor = monitorRectAt(m_textEdit->geometry().center()).intersected(rect());
+    if (monitor.isValid()) {
+        x = qBound(monitor.left() + 4, x,
+                   qMax(monitor.left() + 4, monitor.right() - m_textEditPanel->width() - 4));
+        y = qBound(monitor.top() + 4, y,
+                   qMax(monitor.top() + 4, monitor.bottom() - m_textEditPanel->height() - 4));
+    }
+    m_textEditPanel->move(x, y);
+    m_textEditPanel->raise();
+    m_textEdit->raise();
+}
+
+void CaptureOverlay::applyTextStyleToEngine(const AnnotationEngine::TextStyle &style)
+{
+    m_annotationEngine->setTextFontFamily(style.fontFamily);
+    m_annotationEngine->setTextFontSize(style.fontSize);
+    m_annotationEngine->setColor(style.color);
+    m_annotationEngine->setTextBold(style.bold);
+    m_annotationEngine->setTextBackground(style.background);
+    if (m_toolbar)
+        m_toolbar->setColor(style.color);
+}
+
+void CaptureOverlay::beginEditExistingText(int index)
+{
+    if (!m_annotationEngine || !m_textEdit || !m_annotationEngine->isTextAnnotation(index))
+        return;
+    const QString text = m_annotationEngine->textOf(index);
+    const QPoint anchor = m_annotationEngine->textAnchorOf(index);
+    if (m_textEdit->isVisible()) {
+        commitText();
+        m_textJustCommitted = false;
+        // Committing an emptied label removes it and shifts later indices.
+        if (!m_annotationEngine->isTextAnnotation(index)
+            || m_annotationEngine->textOf(index) != text) {
+            return;
+        }
+    }
+
+    // The editor works on the engine's current text style; remember it so
+    // editing an old label does not change the style of the next new one.
+    m_styleBeforeTextEdit = m_annotationEngine->currentTextStyle();
+    applyTextStyleToEngine(m_annotationEngine->textStyleOf(index));
+    m_editingTextIndex = index;
+    m_annotationEngine->setSelectedIndex(-1);
+    m_annotationEngine->setHiddenIndex(index);
+
+    beginTextEditAt(anchor);
+    m_textEditStartPosition = m_textEditPosition;
+    m_textEdit->setPlainText(text);
+    QTextCursor cursor = m_textEdit->textCursor();
+    cursor.movePosition(QTextCursor::End);
+    m_textEdit->setTextCursor(cursor);
+    if (m_textFocusProxy && m_textFocusProxy->isVisible()) {
+        QSignalBlocker blocker(m_textFocusProxy);
+        m_textFocusProxy->setPlainText(text);
+        m_textFocusProxy->moveCursor(QTextCursor::End);
+    }
+    update();
+}
+
+void CaptureOverlay::finishExistingTextEdit()
+{
+    if (m_editingTextIndex < 0)
+        return;
+    m_editingTextIndex = -1;
+    if (m_annotationEngine) {
+        m_annotationEngine->setHiddenIndex(-1);
+        applyTextStyleToEngine(m_styleBeforeTextEdit);
+    }
+}
+
+QIcon CaptureOverlay::textBackgroundIcon(int background) const
+{
+    QPixmap pixmap(QSize(40, 40));
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    QFont font(QStringLiteral("Segoe UI"));
+    font.setBold(true);
+    font.setPixelSize(26);
+    QPainterPath glyph;
+    glyph.addText(0, 0, font, QStringLiteral("A"));
+    const QRectF bounds = glyph.boundingRect();
+    glyph.translate(20 - bounds.center().x(), 20 - bounds.center().y());
+    if (background == AnnotationEngine::TextBox) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(255, 255, 255, 70));
+        painter.drawRoundedRect(QRectF(3, 3, 34, 34), 6, 6);
+    } else if (background == AnnotationEngine::TextOutline) {
+        painter.setPen(QPen(QColor(0, 0, 0, 230), 5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawPath(glyph);
+    }
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(Qt::white);
+    painter.drawPath(glyph);
+    painter.end();
+    return QIcon(pixmap);
+}
+
+void CaptureOverlay::refreshTextStyleButtons()
+{
+    if (!m_annotationEngine)
+        return;
+    if (m_textBoldButton) {
+        QSignalBlocker blocker(m_textBoldButton);
+        m_textBoldButton->setChecked(m_annotationEngine->textBold());
+    }
+    if (m_textBackgroundButton) {
+        const int background = m_annotationEngine->textBackground();
+        m_textBackgroundButton->setIcon(textBackgroundIcon(background));
+        const QString names[] = {TranslationManager::tr("textBackgroundBox"),
+                                 TranslationManager::tr("textBackgroundPlain"),
+                                 TranslationManager::tr("textBackgroundOutline")};
+        m_textBackgroundButton->setToolTip(TranslationManager::tr("textBackground")
+                                           + QStringLiteral(": ") + names[background]);
+    }
+    updateTextEditorStyle();
+}
+
+void CaptureOverlay::commitText()
+{
+    if (!m_textEdit || m_textEdit->isHidden()) return;
+    QString text = m_textEdit->toPlainText().trimmed();
+    if (m_editingTextIndex >= 0 && m_annotationEngine) {
+        // Clearing an existing label deletes it.
+        m_annotationEngine->updateTextAnnotation(m_editingTextIndex, text,
+                                                 m_annotationEngine->currentTextStyle(),
+                                                 m_textEditPosition - m_textEditStartPosition);
+        finishExistingTextEdit();
+        update();
+        updateUndoRedoState();
+    } else if (!text.isEmpty() && m_annotationEngine) {
+        m_annotationEngine->addTextAnnotation(m_textEditPosition, text);
+        update();
+        updateUndoRedoState();
+    }
+    releaseTextKeyboardFocus();
+    m_textEdit->hide();
+    if (m_textEditPanel) m_textEditPanel->hide();
+    // Swallows only a duplicate of the committing Enter (delivered twice
+    // through the managed focus proxy), not the user's next Enter = copy.
+    m_textJustCommitted = true;
+    QTimer::singleShot(300, this, [this]() { m_textJustCommitted = false; });
+    acquireCaptureKeyboardFocus();
+}
+
+void CaptureOverlay::cancelTextEdit()
+{
+    if (m_editingTextIndex >= 0) {
+        finishExistingTextEdit();
+        update();
+    }
+    if (m_textEdit) {
+        releaseTextKeyboardFocus();
+        m_textEdit->hide();
+    }
+    if (m_textEditPanel) m_textEditPanel->hide();
+    // finishCapture() and cancelCapture() also use this cleanup path after
+    // hiding the overlay. Do not revive the managed input proxy once capture
+    // has ended, otherwise KDE shows it as a separate EShot window.
+    if (isVisible() && m_selectionComplete)
+        acquireCaptureKeyboardFocus();
+    else if (m_textFocusProxy)
+        m_textFocusProxy->hide();
+}
+
+void CaptureOverlay::updateUndoRedoState()
+{
+    if (m_toolbar) {
+        m_toolbar->setUndoEnabled(m_annotationEngine && m_annotationEngine->canUndo());
+        m_toolbar->setRedoEnabled(m_annotationEngine && m_annotationEngine->canRedo());
+    }
+}
+
+bool CaptureOverlay::matchesOverlayShortcut(QKeyEvent *event, const QString &key, const QString &fallback) const
+{
+    if (!event || event->key() == Qt::Key_unknown)
+        return false;
+    const Qt::KeyboardModifiers relevantMods =
+        event->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::ShiftModifier | Qt::MetaModifier);
+    QKeySequence pressed(static_cast<int>(relevantMods) | event->key());
+    // Resolved once per capture (cache cleared in startCaptureInternal)
+    // instead of opening QSettings on every key event.
+    QKeySequence target = m_overlayShortcutCache.value(key);
+    if (target.isEmpty()) {
+        QSettings s("EShot", "EShot");
+        const QString configured = s.value(QStringLiteral("overlayShortcut/%1").arg(key), fallback).toString().trimmed();
+        if (!configured.isEmpty())
+            target = QKeySequence(configured);
+        m_overlayShortcutCache.insert(key, target);
+    }
+    return !target.isEmpty() && target.matches(pressed) == QKeySequence::ExactMatch;
+}
+
+void CaptureOverlay::selectAnnotationTool(int toolId)
+{
+    if (!m_annotationEngine)
+        return;
+    if (m_toolbar)
+        m_toolbar->selectTool(toolId);
+    // Same path as a toolbar click: remembers the tool and shows its hints.
+    onToolSelected(toolId);
+}
+
+void CaptureOverlay::onClose() { cancelCapture(); }
+
+void CaptureOverlay::onEyedropperRequested()
+{
+    ensureComposedSnapshot();
+    if (m_eyedropperImage.isNull() && !m_screenSnapshot.isNull())
+        m_eyedropperImage = m_screenSnapshot.toImage();
+    m_eyedropperActive = true;
+    setCursor(Qt::CrossCursor);
+    update();
+}
+
+void CaptureOverlay::onSelectionLockToggled(bool locked)
+{
+    m_selectionLocked = locked;
+    if (m_toolbar)
+        m_toolbar->setSelectionLocked(locked);
+}
+
+void CaptureOverlay::onOcrRequested()
+{
+    QPixmap pix = getSelectedPixmap();
+    if (pix.isNull()) return;
+    // OcrDialog restores the saved OCR language itself.
+    hideForModalDialog();
+    OcrDialog dlg(pix);
+    dlg.exec();
+    restoreAfterModalDialog();
+}
+
+void CaptureOverlay::onUploadRequested()
+{
+    QPixmap pix = getSelectedPixmap();
+    if (pix.isNull()) return;
+    hideForModalDialog();
+    UploadDialog dlg;
+    dlg.setImage(pix);
+    dlg.exec();
+    restoreAfterModalDialog();
+}
+
+void CaptureOverlay::hideForModalDialog()
+{
+    // The managed input proxy is a separate top-level window. Its keyboard
+    // grab would otherwise keep all keys away from the dialog.
+    releaseTextKeyboardFocus();
+    if (m_textFocusProxy)
+        m_textFocusProxy->hide();
+    hide();
+}
+
+void CaptureOverlay::restoreAfterModalDialog()
+{
+    if (m_screenViews)
+        presentCapture();
+    else
+        show();
+    if (m_selectionComplete)
+        showToolbar();
+
+    QPointer<CaptureOverlay> self(this);
+    QTimer::singleShot(0, this, [self]() {
+        if (!self)
+            return;
+        self->raise();
+        self->acquireCaptureKeyboardFocus();
+    });
+}
+
+void CaptureOverlay::onGoogleLensRequested()
+{
+    QPixmap pix = getSelectedPixmap();
+    if (pix.isNull()) return;
+
+    if (m_googleLensUploader) {
+        m_googleLensUploader->disconnect(this);
+        m_googleLensUploader->cancel();
+        m_googleLensUploader->deleteLater();
+        m_googleLensUploader = nullptr;
+    }
+    if (!m_visualSearchImagePath.isEmpty()) {
+        QFile::remove(m_visualSearchImagePath);
+        m_visualSearchImagePath.clear();
+    }
+
+    const quint64 generation = m_visualSearchOperations.begin();
+    m_visualSearchUploadFallbacks = VisualSearchUploadFallbackState();
+    QImage uploadImage = pix.toImage();
+    const QSize uploadSize = visualSearchUploadSize(uploadImage.size());
+    if (uploadSize != uploadImage.size())
+        uploadImage = uploadImage.scaled(uploadSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QTemporaryFile uploadFile(QDir::tempPath() + QStringLiteral("/eshot_visual_search_XXXXXX.jpg"));
+    uploadFile.setAutoRemove(false);
+    if (!uploadFile.open()) {
+        QMessageBox::warning(this, TranslationManager::visualSearchFailed(),
+                             TranslationManager::visualSearchTempCreateError());
+        return;
+    }
+    m_visualSearchImagePath = uploadFile.fileName();
+    uploadFile.close();
+    if (!uploadImage.save(m_visualSearchImagePath, "JPEG", 88)) {
+        QFile::remove(m_visualSearchImagePath);
+        m_visualSearchImagePath.clear();
+        QMessageBox::warning(this, TranslationManager::visualSearchFailed(),
+                             TranslationManager::visualSearchTempPrepareError());
+        return;
+    }
+
+    QSettings settings(QStringLiteral("EShot"), QStringLiteral("EShot"));
+    const VisualSearchProvider provider = visualSearchProviderFromSettings(
+        settings.value("visualSearchProvider", QStringLiteral("google")).toString());
+    hide();
+    hideToolbar();
+    startNextVisualSearchUpload(generation, provider);
+}
+
+void CaptureOverlay::startNextVisualSearchUpload(quint64 generation, VisualSearchProvider provider)
+{
+    if (!m_visualSearchOperations.isCurrent(generation))
+        return;
+
+    VisualSearchUploadProvider fallbackProvider;
+    if (!m_visualSearchUploadFallbacks.takeNext(&fallbackProvider)) {
+        const QString details = m_visualSearchUploadFallbacks.failureSummary();
+        clearVisualSearchUpload();
+        QMessageBox::warning(this, TranslationManager::uploadFailed(),
+                             TranslationManager::visualSearchUploadUnavailable(details));
+        restoreAfterModalDialog();
+        return;
+    }
+
+    ImageUploader::Provider imageProvider = ImageUploader::Provider::Catbox;
+    switch (fallbackProvider) {
+    case VisualSearchUploadProvider::Catbox:
+        imageProvider = ImageUploader::Provider::Catbox;
+        break;
+    case VisualSearchUploadProvider::Uguu:
+        imageProvider = ImageUploader::Provider::Uguu;
+        break;
+    case VisualSearchUploadProvider::TmpFiles:
+        imageProvider = ImageUploader::Provider::TmpFiles;
+        break;
+    }
+
+    m_googleLensUploader = ImageUploader::create(imageProvider, this);
+    if (!m_googleLensUploader) {
+        m_visualSearchUploadFallbacks.recordFailure(
+            QStringLiteral("EShot"), TranslationManager::visualSearchUploaderCreateError());
+        startNextVisualSearchUpload(generation, provider);
+        return;
+    }
+
+    ImageUploader *uploader = m_googleLensUploader;
+    const QString uploaderName = uploader->providerDisplayName();
+    QPointer<CaptureOverlay> self(this);
+    connect(uploader, &ImageUploader::succeeded, this,
+            [this, self, uploader, generation, provider](const QString &url, const QString &) {
+        if (!self || !m_visualSearchOperations.isCurrent(generation) || m_googleLensUploader != uploader)
+            return;
+        const bool browserOpened = QDesktopServices::openUrl(visualSearchResultUrl(provider, QUrl(url)));
+        uploader->deleteLater();
+        m_googleLensUploader = nullptr;
+        clearVisualSearchUpload();
+        if (!browserOpened) {
+            QMessageBox::warning(this, TranslationManager::visualSearchBrowserLaunchTitle(),
+                                 TranslationManager::visualSearchBrowserLaunchError());
+            restoreAfterModalDialog();
+        }
+    });
+    connect(uploader, &ImageUploader::failed, this,
+            [this, self, uploader, uploaderName, generation, provider](const QString &reason) {
+        if (!self || !m_visualSearchOperations.isCurrent(generation) || m_googleLensUploader != uploader)
+            return;
+        m_visualSearchUploadFallbacks.recordFailure(uploaderName, reason);
+        uploader->deleteLater();
+        m_googleLensUploader = nullptr;
+        QTimer::singleShot(0, this, [this, self, generation, provider]() {
+            if (self)
+                startNextVisualSearchUpload(generation, provider);
+        });
+    });
+    uploader->setImagePath(m_visualSearchImagePath);
+    uploader->upload();
+}
+
+void CaptureOverlay::clearVisualSearchUpload()
+{
+    if (!m_visualSearchImagePath.isEmpty()) {
+        QFile::remove(m_visualSearchImagePath);
+        m_visualSearchImagePath.clear();
+    }
+}
+
+void CaptureOverlay::onRecordRequested()
+{
+    if (normalizedSelectionRect().isEmpty())
+        return;
+    showRecordingDrawer(recordingDrawerModeFromKey(
+        QSettings("EShot", "EShot").value(QStringLiteral("recordingDrawerMode")).toString()));
+}
+
+void CaptureOverlay::onGifRequested()
+{
+    if (normalizedSelectionRect().isEmpty())
+        return;
+    showRecordingDrawer(RecordingDrawerMode::Gif);
+}
+
+void CaptureOverlay::onVideoRequested()
+{
+    if (normalizedSelectionRect().isEmpty())
+        return;
+    showRecordingDrawer(RecordingDrawerMode::Video);
+}
+
+QRect CaptureOverlay::normalizedSelectionRect() const
+{
+    return QRect(m_selectionStart, m_selectionEnd).normalized();
+}
+
+QRect CaptureOverlay::selectedCaptureRect() const
+{
+    if (!m_screenImages.isEmpty()) {
+        const QRect logical = normalizedSelectionRect().translated(m_virtualDesktopRect.topLeft());
+        return physicalRectFromLogical(logical, captureSelectionScale(m_screenImages, logical));
+    }
+    QRect captureRect = logicalToSnapshot(normalizedSelectionRect());
+    return captureRect.translated(m_physicalVirtualDesktopTopLeft);
+}
+
+QRect CaptureOverlay::selectedDisplayRect() const
+{
+#ifdef Q_OS_WIN
+    const QRect displayRect = displayRectFromPhysical(selectedCaptureRect(), m_captureMonitors);
+    if (displayRect.isValid())
+        return displayRect;
+#endif
+    return normalizedSelectionRect().translated(m_virtualDesktopRect.topLeft());
+}
+
+QRect CaptureOverlay::monitorRectAt(const QPoint &pos) const
+{
+#ifdef Q_OS_WIN
+    // pos is logical (widget-local). Resolve against the per-monitor capture
+    // table so mixed-DPI setups pick the correct monitor geometry instead of
+    // scaling everything with the primary screen ratio.
+    const QPoint globalLogical = pos + m_virtualDesktopRect.topLeft();
+    for (const CaptureMonitorGeometry &monitor : m_captureMonitors) {
+        if (!monitor.logical.isValid() || !monitor.physical.isValid() || monitor.scale <= 0.0)
+            continue;
+        const QPoint physicalPoint(
+            monitor.physical.x() + qRound((globalLogical.x() - monitor.logical.x()) * monitor.scale),
+            monitor.physical.y() + qRound((globalLogical.y() - monitor.logical.y()) * monitor.scale));
+        if (monitor.physical.contains(physicalPoint)) {
+            return displayRectFromPhysical(monitor.physical, m_captureMonitors)
+                .translated(-m_virtualDesktopRect.topLeft()).intersected(rect());
+        }
+    }
+
+    // Fallback: Win32 monitor lookup bridged by the primary ratio.
+    POINT nativePoint = {
+        (LONG)qRound((pos.x() + m_virtualDesktopRect.x()) * m_dpr),
+        (LONG)qRound((pos.y() + m_virtualDesktopRect.y()) * m_dpr)
+    };
+    HMONITOR monitor = MonitorFromPoint(nativePoint, MONITOR_DEFAULTTONULL);
+    if (!monitor) return QRect();
+
+    MONITORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return QRect();
+
+    // rcMonitor is physical; return a logical, widget-local rect.
+    return QRect(
+        qRound(info.rcMonitor.left / m_dpr) - m_virtualDesktopRect.x(),
+        qRound(info.rcMonitor.top / m_dpr) - m_virtualDesktopRect.y(),
+        qRound((info.rcMonitor.right - info.rcMonitor.left) / m_dpr),
+        qRound((info.rcMonitor.bottom - info.rcMonitor.top) / m_dpr)
+    ).intersected(rect());
+#else
+    for (QScreen *screen : QGuiApplication::screens()) {
+        QRect geometry = screen->geometry();
+        QRect localRect(
+            geometry.x() - m_virtualDesktopRect.x(),
+            geometry.y() - m_virtualDesktopRect.y(),
+            geometry.width(),
+            geometry.height()
+        );
+        if (localRect.contains(pos))
+            return localRect.intersected(rect());
+    }
+    return QRect();
+#endif
+}
+
+bool CaptureOverlay::manualSelectionAllowed() const
+{
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    // KWin may not answer (scripting disabled, slow compositor); the window
+    // capture must still let the user drag a region.
+    return allowsManualSelection(m_selectionMode, true);
+#else
+    return allowsManualSelection(m_selectionMode);
+#endif
+}
+
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+void CaptureOverlay::requestKdeWindowList()
+{
+    if (m_selectionMode != CaptureSelectionMode::Window || !windowCaptureSupported())
+        return;
+    if (!m_kwinWindowList) {
+        m_kwinWindowList = new KWinWindowListClient(this);
+        connect(m_kwinWindowList, &KWinWindowListClient::windowListReceived,
+                this, [this](const KWinWindowSnapshot &snapshot) {
+                    m_kdeWindowSnapshot = snapshot;
+                    applyKdeWindowList();
+                });
+    }
+    if (!m_kwinWindowList->request(1000))
+        qWarning() << "[CaptureOverlay] could not ask KWin for the window list";
+}
+
+void CaptureOverlay::applyKdeWindowList()
+{
+    // The geometry is known once the screenshot was taken and presented.
+    if (!m_kdeWindowSnapshot.valid || m_captureInFlight || m_virtualDesktopRect.isEmpty()
+        || m_selectionMode != CaptureSelectionMode::Window) {
+        return;
+    }
+    QVector<KWinQtScreen> screens;
+    for (QScreen *screen : QGuiApplication::screens())
+        screens.append({screen->name(), screen->geometry()});
+    m_windowSnapCandidates = KWinWindowList::overlayRects(
+        m_kdeWindowSnapshot, QCoreApplication::applicationPid(), screens,
+        m_virtualDesktopRect.topLeft(), m_virtualDesktopRect.size());
+    qInfo() << "[CaptureOverlay] window selection candidates=" << m_windowSnapCandidates.size();
+    if (!m_isSelecting && !m_selectionComplete && !m_windowSnapClickPending) {
+        setHoveredWindowRect(windowSnapTargetForMode(
+            m_selectionMode, m_windowSnapCandidates,
+            capturePositionFromGlobal(QCursor::pos()), rect()));
+    }
+}
+#endif
+
+void CaptureOverlay::setHoveredWindowRect(const QRect &targetRect)
+{
+    const QRect currentRect = m_animatedWindowRect.isValid()
+        ? m_animatedWindowRect : m_hoveredWindowRect;
+    if (m_windowSnapAnimation)
+        m_windowSnapAnimation->stop();
+
+    if (targetRect == m_hoveredWindowRect) {
+        if (targetRect.isEmpty())
+            m_animatedWindowRect = QRect();
+        return;
+    }
+
+    m_hoveredWindowRect = targetRect;
+    if (targetRect.isEmpty()) {
+        m_animatedWindowRect = QRect();
+        update();
+        return;
+    }
+    if (currentRect.isEmpty() || currentRect == targetRect || !m_windowSnapAnimation) {
+        m_animatedWindowRect = targetRect;
+        update();
+        return;
+    }
+
+    m_windowSnapAnimationStart = currentRect;
+    m_windowSnapAnimation->setDuration(windowSnapAnimationDurationMs());
+    m_windowSnapAnimation->setStartValue(0.0);
+    m_windowSnapAnimation->setEndValue(1.0);
+    m_windowSnapAnimation->start();
+}
+
+void CaptureOverlay::selectMonitorAt(const QPoint &pos)
+{
+    QRect monitorRect = monitorRectAt(pos);
+    if (monitorRect.isEmpty()) return;
+
+    if (m_textEdit) m_textEdit->hide();
+    if (m_textFocusProxy) m_textFocusProxy->hide();
+    if (m_annotationEngine) m_annotationEngine->clear();
+
+    m_isSelecting = false;
+    m_selectionComplete = true;
+    m_windowSnapClickPending = false;
+    setHoveredWindowRect(QRect());
+    m_pressedWindowRect = QRect();
+    m_isDraggingAnnotation = false;
+    m_resizeMode = ResNone;
+    m_selectionStart = monitorRect.topLeft();
+    m_selectionEnd = monitorRect.bottomRight();
+    m_selectionAnchorScreenRect = monitorRect;
+
+    if (m_captureMode == ModeRecording) {
+        finishCapture();
+        return;
+    }
+
+    applyAutoSelectionLock();
+    showToolbar();
+    if (shouldRestoreCaptureKeyboardFocus(
+            isVisible(), m_selectionComplete,
+            m_textEdit && m_textEdit->isVisible())) {
+        acquireCaptureKeyboardFocus();
+    }
+    updateUndoRedoState();
+    updateCursor(pos);
+
+    update();
+}
+
+void CaptureOverlay::completeSelection(const QRect &selectionRect)
+{
+    const QRect bounded = selectionRect.intersected(rect());
+    if (bounded.width() <= 10 || bounded.height() <= 10)
+        return;
+
+    m_isSelecting = false;
+    m_selectionComplete = true;
+    m_windowSnapClickPending = false;
+    setHoveredWindowRect(QRect());
+    m_pressedWindowRect = QRect();
+    m_selectionStart = bounded.topLeft();
+    m_selectionEnd = bounded.bottomRight();
+    m_selectionAnchorScreenRect = monitorRectAt(bounded.center());
+    if (m_captureLatencyTimer.isValid()) {
+        qInfo() << "[CaptureOverlay] selection completed after"
+                << m_captureLatencyTimer.elapsed() << "ms";
+        m_captureLatencyTimer.invalidate();
+    }
+
+    if (m_captureMode == ModeRecording) {
+        finishCapture();
+        return;
+    }
+
+    if (m_instantCopyAfterSelection) {
+        onCopyToClipboard();
+        if (isVisible())
+            finishCapture();
+        return;
+    }
+
+    applyAutoSelectionLock();
+    showToolbar();
+    if (shouldRestoreCaptureKeyboardFocus(
+            isVisible(), m_selectionComplete,
+            m_textEdit && m_textEdit->isVisible())) {
+        acquireCaptureKeyboardFocus();
+    }
+    updateUndoRedoState();
+    updateCursor(bounded.center());
+    showSelectionOnboarding();
+    update();
+
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    const QByteArray verifyPath = qgetenv("ESHOT_SCREEN_VERIFY_PATH");
+    if (!verifyPath.isEmpty()) {
+        const QString path = QString::fromLocal8Bit(verifyPath);
+        QTimer::singleShot(250, this, [path]() {
+            const QImage frame = LinuxFastCapture::instance().diagnosticFrame();
+            const bool saved = !frame.isNull() && frame.save(path);
+            qInfo() << "[CaptureOverlay] screen verification frame saved=" << saved
+                    << "path=" << path << "size=" << frame.size();
+        });
+    }
+#endif
+}
+
+void CaptureOverlay::applyAutoSelectionLock()
+{
+    // Same state as the lock button; K or the button still unlocks it.
+    if (m_autoLockSelection && m_selectionComplete && !m_selectionLocked)
+        onSelectionLockToggled(true);
+}
+
+void CaptureOverlay::onToolSelected(int toolId)
+{
+    if (toolId == AnnotationEngine::Blur || toolId == AnnotationEngine::Pixelate)
+        ensureComposedSnapshot();
+    if (m_annotationEngine) {
+        m_annotationEngine->setCurrentTool(static_cast<AnnotationEngine::Tool>(toolId));
+        m_annotationEngine->setSelectedIndex(-1);
+    }
+    updateCounterQuickSettings();
+    m_isDraggingAnnotation = false;
+    QSettings settings("EShot", "EShot");
+    if (settings.value("rememberLastAnnotationTool", false).toBool())
+        settings.setValue("lastAnnotationTool", toolId);
+    if (m_selectionComplete && m_toolbar && m_toolbar->isVisible())
+        showToolbar();
+    if (toolId == AnnotationEngine::Highlighter) {
+        QSettings settings(QStringLiteral("EShot"), QStringLiteral("EShot"));
+        const int shownCount = settings.value(QStringLiteral("highlighterStraightHintShown"), 0).toInt();
+        if (shownCount < 3) {
+            settings.setValue(QStringLiteral("highlighterStraightHintShown"), shownCount + 1);
+            m_showHighlighterStraightHint = true;
+            update();
+            const quint64 generation = m_captureGeneration;
+            QTimer::singleShot(2200, this, [this, generation]() {
+                if (generation != m_captureGeneration)
+                    return;
+                m_showHighlighterStraightHint = false;
+                update();
+            });
+        }
+    }
+    showToolOnboarding(toolId);
+    QTimer::singleShot(0, this, [this]() {
+        if (isVisible() && m_selectionComplete
+            && (!m_textEdit || !m_textEdit->isVisible()))
+            acquireCaptureKeyboardFocus();
+    });
+}
+
+void CaptureOverlay::drawSelectionHint(QPainter &painter)
+{
+    struct Item { QString key; QString label; };
+    QList<Item> items;
+    const QString copyKey = OnboardingTips::overlayShortcutText(QStringLiteral("actionCopy"),
+                                                                QStringLiteral("Ctrl+C"));
+    items.append({copyKey.isEmpty() ? QStringLiteral("Enter") : QStringLiteral("Enter / ") + copyKey,
+                  TranslationManager::captureHintCopy()});
+    const QString saveKey = OnboardingTips::overlayShortcutText(QStringLiteral("actionSave"),
+                                                                QStringLiteral("Ctrl+S"));
+    if (!saveKey.isEmpty())
+        items.append({saveKey, TranslationManager::captureHintSave()});
+    items.append({QStringLiteral("?"), TranslationManager::tr("captureHintShortcuts")});
+
+    QFont keyFont = painter.font();
+    keyFont.setPointSize(9);
+    keyFont.setWeight(QFont::DemiBold);
+    QFont labelFont = keyFont;
+    labelFont.setWeight(QFont::Normal);
+    int width = 24;
+    for (int i = 0; i < items.size(); ++i) {
+        width += QFontMetrics(keyFont).horizontalAdvance(items[i].key) + 14
+            + 7 + QFontMetrics(labelFont).horizontalAdvance(items[i].label);
+        if (i + 1 < items.size())
+            width += 16;
+    }
+
+    // Inside the top of the selection, or above it when the region is small.
+    const QRect selection = normalizedSelectionRect();
+    QRect strip(0, 0, width, 34);
+    if (selection.width() >= width + 24 && selection.height() >= 120)
+        strip.moveTopLeft(QPoint(selection.center().x() - width / 2, selection.top() + 12));
+    else
+        strip.moveTopLeft(QPoint(selection.center().x() - width / 2, selection.top() - 44));
+    strip.moveLeft(qBound(4, strip.left(), qMax(4, this->width() - strip.width() - 4)));
+    strip.moveTop(qBound(4, strip.top(), qMax(4, height() - strip.height() - 4)));
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(255, 255, 255, 42), 1));
+    painter.setBrush(QColor(20, 20, 22, 205));
+    painter.drawRoundedRect(strip, 9, 9);
+    int x = strip.left() + 12;
+    for (int i = 0; i < items.size(); ++i) {
+        drawCaptureHintShortcut(painter, x, strip.top() + 5, items[i].key, items[i].label, false);
+        x += 16;
+    }
+    painter.restore();
+}
+
+bool CaptureOverlay::isShortcutSheetOpen() const
+{
+    return m_shortcutSheet && m_shortcutSheet->isVisible();
+}
+
+void CaptureOverlay::toggleShortcutSheet()
+{
+    if (m_textEdit && m_textEdit->isVisible())
+        commitText();
+    if (m_hintBubble)
+        m_hintBubble->dismiss();
+    if (isShortcutSheetOpen()) {
+        m_shortcutSheet->hide();
+    } else {
+        if (!m_shortcutSheet) {
+            m_shortcutSheet = new ShortcutSheetLayer(this);
+            // Closed by a click: repaint the hints it covered and keep keys
+            // on the canvas.
+            connect(m_shortcutSheet, &ShortcutSheetLayer::closed, this, [this]() {
+                update();
+                acquireCaptureKeyboardFocus();
+            });
+        }
+        const QRect monitor = m_selectionComplete
+            ? monitorRectAt(normalizedSelectionRect().center())
+            : monitorRectAt(capturePositionFromGlobal(QCursor::pos()));
+        m_shortcutSheet->open(monitor, m_selectionMode == CaptureSelectionMode::Window);
+    }
+    update();
+    // The panel button took focus; keep keys (Esc, ?) on the canvas.
+    acquireCaptureKeyboardFocus();
+}
+
+HintBubble *CaptureOverlay::hintBubble()
+{
+    if (!m_hintBubble)
+        m_hintBubble = new HintBubble(this);
+    return m_hintBubble;
+}
+
+void CaptureOverlay::showSelectionOnboarding()
+{
+    // A short strip with the three things to do next, for the first captures.
+    constexpr int SelectionHintCaptures = 3;
+    if (OnboardingTips::count(OnboardingTips::SelectionHintCount) < SelectionHintCaptures) {
+        OnboardingTips::increment(OnboardingTips::SelectionHintCount);
+        m_showSelectionHint = true;
+        QPointer<CaptureOverlay> self(this);
+        const quint64 generation = m_captureGeneration;
+        QTimer::singleShot(4500, this, [self, generation]() {
+            if (!self || generation != self->m_captureGeneration)
+                return;
+            self->m_showSelectionHint = false;
+            self->update();
+        });
+    }
+
+    if (!m_toolSettingsButton)
+        return;
+    // The Quick Settings tab is easy to miss: glow it for the first captures
+    // and point at it once.
+    constexpr int TabGlowCaptures = 3;
+    if (OnboardingTips::count(OnboardingTips::TabGlowCount) < TabGlowCaptures) {
+        OnboardingTips::increment(OnboardingTips::TabGlowCount);
+        auto *tab = static_cast<SideTabButton *>(m_toolSettingsButton);
+        auto *glow = new QVariantAnimation(this);
+        glow->setDuration(1300);
+        glow->setKeyValueAt(0.0, 0.0);
+        glow->setKeyValueAt(0.5, 1.0);
+        glow->setKeyValueAt(1.0, 0.0);
+        glow->setLoopCount(2);
+        connect(glow, &QVariantAnimation::valueChanged, tab, [tab](const QVariant &value) {
+            tab->setGlow(value.toReal());
+        });
+        connect(glow, &QVariantAnimation::finished, tab, [tab]() { tab->setGlow(0.0); });
+        glow->start(QAbstractAnimation::DeleteWhenStopped);
+    }
+    if (!OnboardingTips::isSeen(OnboardingTips::QuickSettingsTip)) {
+        QPointer<CaptureOverlay> self(this);
+        const quint64 generation = m_captureGeneration;
+        QTimer::singleShot(700, this, [self, generation]() {
+            if (!self || generation != self->m_captureGeneration || !self->m_selectionComplete || !self->m_toolSettingsButton
+                || !self->m_toolSettingsButton->isVisible()) {
+                return;
+            }
+            OnboardingTips::markSeen(OnboardingTips::QuickSettingsTip);
+            self->hintBubble()->showTip(TranslationManager::tr("tipQuickSettings"),
+                                        self->m_toolSettingsButton->geometry(),
+                                        HintBubble::Pointer::Left, self->rect());
+        });
+    }
+}
+
+void CaptureOverlay::showToolOnboarding(int toolId)
+{
+    if (!m_selectionComplete)
+        return;
+    if (toolId == AnnotationEngine::Text && !OnboardingTips::isSeen(OnboardingTips::TextToolTip)
+        && m_toolbar && m_toolbar->isVisible()) {
+        OnboardingTips::markSeen(OnboardingTips::TextToolTip);
+        const QRect toolbar = m_toolbar->geometry();
+        const bool toolbarBelow = toolbar.center().y() > normalizedSelectionRect().center().y();
+        hintBubble()->showTip(TranslationManager::tr("tipTextTool"), toolbar,
+                              toolbarBelow ? HintBubble::Pointer::Down : HintBubble::Pointer::Up,
+                              rect());
+        return;
+    }
+
+    // First use of a tool with options: open Quick Settings briefly so its
+    // sliders are seen once.
+    const bool hasOptions = toolId == AnnotationEngine::Pen || toolId == AnnotationEngine::Arrow
+        || toolId == AnnotationEngine::Line || toolId == AnnotationEngine::Rectangle
+        || toolId == AnnotationEngine::Circle || toolId == AnnotationEngine::Highlighter
+        || toolId == AnnotationEngine::Blur || toolId == AnnotationEngine::Pixelate;
+    if (hasOptions && !OnboardingTips::isSeen(OnboardingTips::DrawerPeek)
+        && m_toolSettingsDrawer && !m_toolSettingsDrawer->isVisible()) {
+        OnboardingTips::markSeen(OnboardingTips::DrawerPeek);
+        if (m_hintBubble)
+            m_hintBubble->dismiss();
+        setToolSettingsDrawerVisible(true);
+        QPointer<CaptureOverlay> self(this);
+        const quint64 generation = m_captureGeneration;
+        QTimer::singleShot(2600, this, [self, generation]() {
+            if (self && generation == self->m_captureGeneration && self->m_toolSettingsDrawer && self->m_toolSettingsDrawer->isVisible()
+                && !self->m_toolSettingsDrawer->underMouse()) {
+                self->setToolSettingsDrawerVisible(false);
+            }
+        });
+    }
+}
+
+void CaptureOverlay::onCopyToClipboard()
+{
+    QPixmap result = getSelectedPixmap();
+    if (result.isNull()) return;
+    QGuiApplication::clipboard()->setPixmap(result);
+
+    // Close overlay if closeAfterCopy is enabled
+    if (m_closeAfterCopy) {
+        finishCapture();
+    }
+}
+
+void CaptureOverlay::onSave()
+{
+    QPixmap result = getSelectedPixmap();
+    if (result.isNull()) return;
+
+    QString error;
+    if (!saveScreenshotFile(result, true, &error)) {
+        // Explains Controlled folder access when that is the likely cause and
+        // keeps the image on the clipboard.
+        ProtectedFolderHint::warnScreenshotSaveFailed(this, TranslationManager::errTitle(),
+                                                      m_lastFailedSavePath, result, error);
+        return;
+    }
+    finishCapture();
+}
+
+bool CaptureOverlay::saveScreenshotFile(const QPixmap &result, bool useCliPath, QString *error)
+{
+    QSettings s("EShot", "EShot");
+    QString cliFullPath = useCliPath ? s.value("cliSaveFullPath").toString() : QString();
+    // A --save path belongs to that one capture. If it was cancelled or
+    // copied instead, a much later Save must not overwrite that file.
+    const qint64 requestedAt = s.value("cliSaveRequestedAt", 0).toLongLong();
+    if (QDateTime::currentSecsSinceEpoch() - requestedAt > 300)
+        cliFullPath.clear();
+    if (useCliPath) {
+        s.remove("cliSaveFullPath");
+        s.remove("cliSaveRequestedAt");
+    }
+    QString path = s.contains("screenshotSavePath")
+        ? s.value("screenshotSavePath").toString().trimmed()
+        : QDir(ComponentPaths::defaultSaveDirectory()).filePath(QStringLiteral("Screenshots"));
+    if (path.isEmpty())
+        path = s.value("savePath", ComponentPaths::defaultSaveDirectory()).toString();
+    if (path.trimmed().isEmpty())
+        path = ComponentPaths::defaultSaveDirectory();
+    QString format = s.value("imageFormat", "PNG").toString();
+    int quality = s.value("imageQuality", 95).toInt();
+    QString pattern = s.value("filenamePattern", "Screenshot_%Y-%M-%D_%h-%m-%s").toString();
+    if (pattern.trimmed().isEmpty())
+        pattern = QStringLiteral("Screenshot_%Y-%M-%D_%h-%m-%s");
+    bool copyPathAfterSave = s.value("copyPathAfterSave", false).toBool();
+
+    QString filename;
+    if (!cliFullPath.isEmpty()) {
+        filename = cliFullPath;
+        QFileInfo fi(filename);
+        if (!fi.absoluteDir().exists() && !QDir().mkpath(fi.absolutePath())) {
+            m_lastFailedSavePath = filename;
+            if (error)
+                *error = TranslationManager::errSaveDir() + fi.absolutePath();
+            return false;
+        }
+    } else {
+        QDir dir(path);
+        if (!dir.exists() && !dir.mkpath(".")) {
+            m_lastFailedSavePath = path;
+            if (error)
+                *error = TranslationManager::errSaveDir() + path;
+            return false;
+        }
+
+        QString ext = format.toLower();
+        if (ext == "jpeg") ext = "jpg";
+
+        QString baseName = resolveFilenamePattern(pattern);
+        filename = QString("%1/%2.%3").arg(path, baseName, ext);
+
+        if (QFile::exists(filename)) {
+            int counter = 1;
+            while (QFile::exists(QString("%1/%2_%3.%4").arg(path, baseName, QString::number(counter), ext)))
+                counter++;
+            filename = QString("%1/%2_%3.%4").arg(path, baseName, QString::number(counter), ext);
+        }
+    }
+
+    bool saved = false;
+    if (format == "PNG") saved = result.save(filename, "PNG");
+    else if (format == "JPEG") saved = result.save(filename, "JPEG", quality);
+    else if (format == "BMP") saved = result.save(filename, "BMP");
+    else saved = result.save(filename);
+
+    if (saved) {
+        qDebug() << "[CaptureOverlay] Saved:" << filename;
+        emit captureSaved(filename);
+        if (copyPathAfterSave) {
+            QGuiApplication::clipboard()->setText(QDir::toNativeSeparators(filename));
+        }
+    } else {
+        qWarning() << "[CaptureOverlay] Save failed:" << filename;
+        m_lastFailedSavePath = filename;
+        if (error)
+            *error = TranslationManager::tr("errSaveFile") + QDir::toNativeSeparators(filename);
+        return false;
+    }
+    return true;
+}
+
+void CaptureOverlay::onPinToDesktop()
+{
+    qreal outputScale = 0.0;
+    QPixmap result = getSelectedPixmap(&outputScale);
+    if (result.isNull()) return;
+
+    QRect selRect = normalizedSelectionRect();
+    QPoint screenPos = mapToGlobal(selRect.topLeft());
+
+    // PinnedWindow shows itself and is deleted when closed (WA_DeleteOnClose).
+    // Per-output captures carry their own scale (mixed-DPI XWayland); the
+    // single-bitmap paths keep using the target screen's ratio.
+    new PinnedWindow(result, screenPos, m_screenImages.isEmpty() ? 0.0 : outputScale);
+
+    hide();
+    m_selectionComplete = false;
+    m_isSelecting = false;
+    m_selectionAnchorScreenRect = QRect();
+    hideToolbar();
+    cancelTextEdit();
+    releaseCaptureBuffers();
+
+    qDebug() << "[CaptureOverlay] Pinned to desktop at" << screenPos;
+}
+
+
+
+CaptureOverlay::ResizeMode CaptureOverlay::getResizeMode(const QPoint &pos)
+{
+    switch (selectionResizeHandleAt(normalizedSelectionRect(), pos)) {
+    case SelectionResizeHandle::TopLeft: return ResTopLeft;
+    case SelectionResizeHandle::Top: return ResTop;
+    case SelectionResizeHandle::TopRight: return ResTopRight;
+    case SelectionResizeHandle::Right: return ResRight;
+    case SelectionResizeHandle::BottomRight: return ResBottomRight;
+    case SelectionResizeHandle::Bottom: return ResBottom;
+    case SelectionResizeHandle::BottomLeft: return ResBottomLeft;
+    case SelectionResizeHandle::Left: return ResLeft;
+    case SelectionResizeHandle::Move: return ResMove;
+    case SelectionResizeHandle::None: return ResNone;
+    case SelectionResizeHandle::NewSelection: return ResNewSelection;
+    }
+    return ResNewSelection;
+}
+
+void CaptureOverlay::updateCursor(const QPoint &pos)
+{
+    if (!m_selectionComplete) {
+        setCursor(Qt::CrossCursor);
+        return;
+    }
+
+    if (m_annotationEngine && m_annotationEngine->currentTool() != AnnotationEngine::None) {
+        QRect sel = normalizedSelectionRect();
+        setCursor(sel.contains(pos) ? Qt::CrossCursor : Qt::ArrowCursor);
+        return;
+    }
+
+    ResizeMode mode = getResizeMode(pos);
+    switch (mode) {
+        case ResTopLeft:
+        case ResBottomRight:
+            setCursor(Qt::SizeFDiagCursor);
+            break;
+        case ResTopRight:
+        case ResBottomLeft:
+            setCursor(Qt::SizeBDiagCursor);
+            break;
+        case ResTop:
+        case ResBottom:
+            setCursor(Qt::SizeVerCursor);
+            break;
+        case ResLeft:
+        case ResRight:
+            setCursor(Qt::SizeHorCursor);
+            break;
+        case ResMove:
+            if (m_annotationEngine && m_annotationEngine->currentTool() == AnnotationEngine::None)
+                setCursor(Qt::SizeAllCursor);
+            else
+                setCursor(Qt::CrossCursor); // For drawing
+            break;
+        default:
+            setCursor(Qt::ArrowCursor);
+            break;
+    }
+}
